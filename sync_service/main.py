@@ -221,3 +221,4 @@ async def run_full_reindex(supabase_url: str, supabase_key: str, indexer: Candid
             await asyncio.sleep(0.2)
 
     logger.info(f"Full re-index complete: {total} total records.")
+    # 
