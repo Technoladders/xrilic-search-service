@@ -54,6 +54,7 @@ services:
       TYPESENSE_API_KEY:   ${TYPESENSE_API_KEY}
       TYPESENSE_DATA_DIR:  /data
       TYPESENSE_ENABLE_CORS: "true"
+      TYPESENSE_CORS_DOMAINS: "*"
     volumes:
       - typesense-data:/data
     healthcheck:
