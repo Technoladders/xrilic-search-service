@@ -19,7 +19,7 @@ logger = logging.getLogger("indexer")
 COLLECTION_SCHEMA = {
     "name": "candidates",
     "fields": [
-        {"name": "id",                   "type": "string"},
+        # NOTE: "id" is managed automatically by Typesense — do NOT include it here
         {"name": "organization_id",      "type": "string", "facet": True},
         {"name": "full_name",            "type": "string"},
         {"name": "email",                "type": "string", "optional": True},
