@@ -1,0 +1,72 @@
+version: '3.8'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# xrilic-search-service
+# Server path: /home/deploy/apps/xrilic-search-service/docker-compose.yml
+# ─────────────────────────────────────────────────────────────────────────────
+
+networks:
+  zivelogin-network-prod:
+    external: true
+
+services:
+  xrilic-search-service:
+    image: xrilictechnologies/xrilic-search-service:${DOCKER_TAG:-prod-latest}
+    container_name: xrilic-search-service
+    restart: unless-stopped
+
+    networks:
+      - zivelogin-network-prod
+
+    ports:
+      - "8009:8000"      # host:container — Nginx Proxy Manager routes externally
+
+    environment:
+      TYPESENSE_HOST:        typesense          # container name on same network
+      TYPESENSE_PORT:        "8108"
+      TYPESENSE_API_KEY:     ${TYPESENSE_API_KEY}
+      SUPABASE_URL:          ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY:  ${SUPABASE_SERVICE_KEY}
+      WEBHOOK_SECRET:        ${WEBHOOK_SECRET}
+      ADMIN_SECRET:          ${ADMIN_SECRET}
+      POLL_INTERVAL_SEC:     "60"
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    depends_on:
+      - typesense
+
+  # ── Typesense (co-deployed in same compose file) ──────────────────────────
+  typesense:
+    image: typesense/typesense:27.1
+    container_name: typesense
+    restart: unless-stopped
+    networks:
+      - zivelogin-network-prod
+    ports:
+      - "8108:8108"
+    environment:
+      TYPESENSE_API_KEY:   ${TYPESENSE_API_KEY}
+      TYPESENSE_DATA_DIR:  /data
+      TYPESENSE_ENABLE_CORS: "true"
+    volumes:
+      - typesense-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8108/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1.5G
+
+volumes:
+  typesense-data:
+    driver: local

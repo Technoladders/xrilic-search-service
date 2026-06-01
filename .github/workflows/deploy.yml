@@ -1,0 +1,81 @@
+name: Deploy xrilic-search-service
+
+on:
+  push:
+    branches: [main]
+
+env:
+  DOCKER_IMAGE:   xrilictechnologies/xrilic-search-service
+  DOCKER_TAG:     prod-latest
+  DEPLOY_PATH:    /home/deploy/apps/xrilic-search-service
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Docker Hub login ───────────────────────────────────────────────
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── 3. Set up buildx ─────────────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 4. Build and push ─────────────────────────────────────────────────
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # ── 5. Copy docker-compose.yml to server ─────────────────────────────
+      - name: Copy compose file to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host:     ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          source:   docker-compose.yml
+          target:   ${{ env.DEPLOY_PATH }}
+
+      # ── 6. Deploy ─────────────────────────────────────────────────────────
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host:     ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd ${{ env.DEPLOY_PATH }}
+
+            echo "→ Pulling latest images..."
+            docker pull ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+            docker pull typesense/typesense:27.1
+
+                        echo "→ Writing .env..."
+            echo "DOCKER_TAG=${{ env.DOCKER_TAG }}" > .env
+            echo "TYPESENSE_API_KEY=${{ secrets.TYPESENSE_API_KEY }}" >> .env
+            echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> .env
+            echo "SUPABASE_SERVICE_KEY=${{ secrets.SUPABASE_SERVICE_KEY }}" >> .env
+            echo "WEBHOOK_SECRET=${{ secrets.SEARCH_WEBHOOK_SECRET }}" >> .env
+            echo "ADMIN_SECRET=${{ secrets.SEARCH_ADMIN_SECRET }}" >> .env
+
+            echo "→ Restarting containers..."
+            docker compose up -d --force-recreate --remove-orphans
+
+            echo "→ Pruning old images..."
+            docker image prune -f
+
+            echo "✓ xrilic-search-service deployed"
