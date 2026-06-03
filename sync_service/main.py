@@ -171,22 +171,20 @@ async def stats(x_admin_secret: str = Header(None)):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run_full_reindex(supabase_url: str, supabase_key: str, indexer: CandidateIndexer):
-    """
-    Reads ALL records from hr_talent_pool in batches of 500
-    and upserts them into Typesense.
-    """
-    logger.info("Starting full re-index...")
+    logger.info("Starting full re-index with cursor-based pagination...")
     headers = {
         "apikey": supabase_key,
         "Authorization": f"Bearer {supabase_key}",
     }
 
     total = 0
-    offset = 0
+    # Start from the very beginning
+    last_cursor = "1970-01-01T00:00:00+00:00"  # epoch start
     batch_size = 500
 
     async with httpx.AsyncClient(timeout=60) as client:
         while True:
+            # KEY: gt. (greater than) on created_at — cursor advances each batch
             url = (
                 f"{supabase_url}/rest/v1/hr_talent_pool"
                 f"?select=id,candidate_name,email,phone,suggested_title,"
@@ -194,8 +192,9 @@ async def run_full_reindex(supabase_url: str, supabase_key: str, indexer: Candid
                 f"notice_period,top_skills,parsed_experience_years,"
                 f"parsed_current_ctc,parsed_expected_ctc,organization_id,"
                 f"created_at,work_experience,education"
+                f"&created_at=gt.{last_cursor}"
                 f"&order=created_at.asc"
-                f"&offset={offset}&limit={batch_size}"
+                f"&limit={batch_size}"
             )
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
@@ -211,14 +210,13 @@ async def run_full_reindex(supabase_url: str, supabase_key: str, indexer: Candid
                 await indexer.bulk_upsert(docs)
 
             total += len(docs)
-            offset += batch_size
-            logger.info(f"Re-index progress: {total} records indexed...")
+            # Advance cursor to last record's created_at
+            last_cursor = records[-1]["created_at"]
+            logger.info(f"Re-index progress: {total} indexed, cursor={last_cursor}")
 
             if len(records) < batch_size:
-                break
+                break  # Last page
 
-            # Avoid hammering Supabase
             await asyncio.sleep(0.2)
 
     logger.info(f"Full re-index complete: {total} total records.")
-    # 

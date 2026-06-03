@@ -58,7 +58,7 @@ services:
     volumes:
       - typesense-data:/data
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8108/health"]
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/8108 && exit 0 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
