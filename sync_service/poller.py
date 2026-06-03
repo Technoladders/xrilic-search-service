@@ -67,7 +67,8 @@ class SyncPoller:
         Fetch all hr_talent_pool rows updated since last_synced_at.
         Upsert them into Typesense in batches of 500.
         """
-        since = self.last_synced_at.isoformat()
+        # Encode the '+' in the isoformat string
+        since = self.last_synced_at.isoformat().replace("+", "%2B")
         poll_start = datetime.now(timezone.utc)
 
         headers = {

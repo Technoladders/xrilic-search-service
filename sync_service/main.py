@@ -184,6 +184,9 @@ async def run_full_reindex(supabase_url: str, supabase_key: str, indexer: Candid
 
     async with httpx.AsyncClient(timeout=60) as client:
         while True:
+            # URL-encode the '+' sign so Supabase doesn't read it as a space
+            safe_cursor = last_cursor.replace("+", "%2B")
+            
             # KEY: gt. (greater than) on created_at — cursor advances each batch
             url = (
                 f"{supabase_url}/rest/v1/hr_talent_pool"
@@ -192,7 +195,7 @@ async def run_full_reindex(supabase_url: str, supabase_key: str, indexer: Candid
                 f"notice_period,top_skills,parsed_experience_years,"
                 f"parsed_current_ctc,parsed_expected_ctc,organization_id,"
                 f"created_at,work_experience,education"
-                f"&created_at=gt.{last_cursor}"
+                f"&created_at=gt.{safe_cursor}"
                 f"&order=created_at.asc"
                 f"&limit={batch_size}"
             )
