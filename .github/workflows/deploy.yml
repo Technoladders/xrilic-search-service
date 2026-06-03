@@ -48,6 +48,9 @@ jobs:
           key:      ${{ secrets.SSH_PRIVATE_KEY }}
           source:   docker-compose.yml
           target:   ${{ env.DEPLOY_PATH }}
+          timeout: 120s
+          command_timeout: 20m
+          debug: true
 
       # ── 6. Deploy ─────────────────────────────────────────────────────────
       - name: Deploy to server
@@ -56,6 +59,9 @@ jobs:
           host:     ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USERNAME }}
           key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          timeout: 120s
+          command_timeout: 20m
+          debug: true
           script: |
             set -e
             cd ${{ env.DEPLOY_PATH }}
