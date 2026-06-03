@@ -169,13 +169,17 @@ class CandidateIndexer:
         previous_company     = ""
 
         if isinstance(we, list) and len(we) > 0:
+            # SAFEGUARD: Ensure the list item is actually a dictionary before calling .get()
+            we_0 = we[0] if isinstance(we[0], dict) else {}
             if not current_designation:
-                current_designation = (we[0].get("designation") or "").strip()
+                current_designation = (we_0.get("designation") or "").strip()
             if not current_company:
-                current_company = (we[0].get("company") or "").strip()
+                current_company = (we_0.get("company") or "").strip()
+                
             if len(we) > 1:
-                previous_designation = (we[1].get("designation") or "").strip()
-                previous_company     = (we[1].get("company") or "").strip()
+                we_1 = we[1] if isinstance(we[1], dict) else {}
+                previous_designation = (we_1.get("designation") or "").strip()
+                previous_company     = (we_1.get("company") or "").strip()
 
         # ── Education ─────────────────────────────────────────────────────────
         edu = row.get("education") or []
@@ -186,7 +190,9 @@ class CandidateIndexer:
                 edu = []
         education_summary = ""
         if isinstance(edu, list) and len(edu) > 0:
-            education_summary = (edu[0].get("degree") or "").strip()
+            # SAFEGUARD: Ensure education item is a dict
+            edu_0 = edu[0] if isinstance(edu[0], dict) else {}
+            education_summary = (edu_0.get("degree") or "").strip()
 
         # ── Resume snippet (first 2000 chars) ────────────────────────────────
         resume_text = row.get("resume_text") or ""
