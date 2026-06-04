@@ -1,10 +1,15 @@
 """
 indexer.py
-
 Manages the Typesense 'candidates' collection.
   - Schema definition
   - Document transformation (Supabase row → Typesense doc)
   - Upsert / delete / bulk-import operations
+
+v2 changes (Phase 2):
+  - Added 5 new schema fields: previous_titles[], previous_companies[],
+    degree, institution, companies_count
+  - transform_record extracts ALL previous exp entries (not just we[1])
+  - education_summary now includes institution as well
 """
 
 import json
@@ -15,39 +20,47 @@ import httpx
 
 logger = logging.getLogger("indexer")
 
-# ── Collection schema ─────────────────────────────────────────────────────────
+# ── Collection schema ──────────────────────────────────────────────────────────
 COLLECTION_SCHEMA = {
     "name": "candidates",
     "fields": [
-        # NOTE: "id" is managed automatically by Typesense — do NOT include it here
+        {"name": "id",                   "type": "string"},
         {"name": "organization_id",      "type": "string", "facet": True},
         {"name": "full_name",            "type": "string"},
-        {"name": "email",                "type": "string", "optional": True},
-        {"name": "phone",                "type": "string", "optional": True},
-        # ── Role / Title (highest weight in search) ──────────────────────────
-        {"name": "suggested_title",      "type": "string", "optional": True},
-        {"name": "current_designation",  "type": "string", "optional": True, "facet": True},
-        {"name": "current_company",      "type": "string", "optional": True, "facet": True},
-        {"name": "previous_designation", "type": "string", "optional": True},
-        {"name": "previous_company",     "type": "string", "optional": True},
-        # ── Location ─────────────────────────────────────────────────────────
-        {"name": "current_location",     "type": "string", "optional": True, "facet": True},
-        # ── Skills ───────────────────────────────────────────────────────────
+        {"name": "email",                "type": "string",   "optional": True},
+        {"name": "phone",                "type": "string",   "optional": True},
+        # ── Role / Title (highest weight in search) ─────────────────────────
+        {"name": "suggested_title",      "type": "string",   "optional": True},
+        {"name": "current_designation",  "type": "string",   "optional": True, "facet": True},
+        {"name": "current_company",      "type": "string",   "optional": True, "facet": True},
+        {"name": "previous_designation", "type": "string",   "optional": True},
+        {"name": "previous_company",     "type": "string",   "optional": True},
+        # ── NEW v2: all past titles / companies (arrays) ─────────────────────
+        {"name": "previous_titles",      "type": "string[]", "optional": True},
+        {"name": "previous_companies",   "type": "string[]", "optional": True},
+        # ── Location ────────────────────────────────────────────────────────
+        {"name": "current_location",     "type": "string",   "optional": True, "facet": True},
+        # ── Skills ──────────────────────────────────────────────────────────
         # Array of skill name strings — facetable for exact filter
         {"name": "skills",               "type": "string[]", "optional": True, "facet": True},
-        # ── Experience / Compensation ─────────────────────────────────────────
-        {"name": "exp_years",            "type": "int32",   "optional": True},
-        {"name": "current_ctc",          "type": "float",   "optional": True},
-        {"name": "expected_ctc",         "type": "float",   "optional": True},
-        # ── Notice / Availability ─────────────────────────────────────────────
-        {"name": "notice_period",        "type": "string",  "optional": True, "facet": True},
-        # ── Education ────────────────────────────────────────────────────────
-        {"name": "education_summary",    "type": "string",  "optional": True},
+        # ── Experience / Compensation ────────────────────────────────────────
+        {"name": "exp_years",            "type": "int32",    "optional": True},
+        {"name": "current_ctc",          "type": "float",    "optional": True},
+        {"name": "expected_ctc",         "type": "float",    "optional": True},
+        # ── Notice / Availability ────────────────────────────────────────────
+        {"name": "notice_period",        "type": "string",   "optional": True, "facet": True},
+        # ── Education ───────────────────────────────────────────────────────
+        {"name": "education_summary",    "type": "string",   "optional": True},
+        # ── NEW v2: degree (facet for exact filter) + institution ────────────
+        {"name": "degree",               "type": "string",   "optional": True, "facet": True},
+        {"name": "institution",          "type": "string",   "optional": True},
+        # ── NEW v2: companies count ──────────────────────────────────────────
+        {"name": "companies_count",      "type": "int32",    "optional": True},
         # ── Body text (lowest weight — resume snippet for keyword boost) ─────
         # Keep short to reduce RAM — first 2000 chars of resume_text
         # NOT stored, only indexed
-        {"name": "resume_snippet",       "type": "string",  "optional": True, "index": True, "store": False},
-        # ── Sorting ───────────────────────────────────────────────────────────
+        {"name": "resume_snippet",       "type": "string",   "optional": True, "index": True, "store": False},
+        # ── Sorting ──────────────────────────────────────────────────────────
         {"name": "created_at_ts",        "type": "int64"},
     ],
     "default_sorting_field": "created_at_ts",
@@ -56,8 +69,8 @@ COLLECTION_SCHEMA = {
 }
 
 # Fields searched in order of importance — weights control ranking
-QUERY_BY_FIELDS  = "suggested_title,current_designation,current_company,skills,education_summary,resume_snippet"
-QUERY_BY_WEIGHTS = "10,9,5,4,2,1"
+QUERY_BY_FIELDS  = "suggested_title,current_designation,current_company,previous_titles,previous_companies,skills,degree,institution,education_summary,resume_snippet"
+QUERY_BY_WEIGHTS = "10,9,8,7,6,5,4,3,2,1"
 
 
 class CandidateIndexer:
@@ -68,7 +81,7 @@ class CandidateIndexer:
             "Content-Type": "application/json",
         }
 
-    # ── Lifecycle ─────────────────────────────────────────────────────────────
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     async def ping(self) -> bool:
         try:
@@ -115,17 +128,22 @@ class CandidateIndexer:
                 }
             return {"error": r.text}
 
-    # ── Document transform ────────────────────────────────────────────────────
+    # ── Document transform ─────────────────────────────────────────────────────
 
     def transform_record(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Convert a hr_talent_pool row into a Typesense document.
         Returns None if the row is missing required fields.
+
+        v2 changes:
+        - Extract previous_titles[] and previous_companies[] from ALL we[1..N]
+        - Extract degree and institution from education[0]
+        - Compute companies_count = unique companies across all experience
         """
         if not row.get("id") or not row.get("organization_id"):
             return None
 
-        # ── Skills: extract from top_skills JSONB ────────────────────────────
+        # ── Skills: extract from top_skills JSONB ─────────────────────────────
         # top_skills can be:
         #   ["React", "Python"]          (already an array of strings)
         #   [{"name": "React"}, ...]     (array of objects)
@@ -155,7 +173,7 @@ class CandidateIndexer:
         # Deduplicate
         skills = list(dict.fromkeys(skills))
 
-        # ── Work experience fields ────────────────────────────────────────────
+        # ── Work experience fields ─────────────────────────────────────────────
         we = row.get("work_experience") or []
         if isinstance(we, str):
             try:
@@ -168,20 +186,47 @@ class CandidateIndexer:
         previous_designation = ""
         previous_company     = ""
 
-        if isinstance(we, list) and len(we) > 0:
-            # SAFEGUARD: Ensure the list item is actually a dictionary before calling .get()
-            we_0 = we[0] if isinstance(we[0], dict) else {}
-            if not current_designation:
-                current_designation = (we_0.get("designation") or "").strip()
-            if not current_company:
-                current_company = (we_0.get("company") or "").strip()
-                
-            if len(we) > 1:
-                we_1 = we[1] if isinstance(we[1], dict) else {}
-                previous_designation = (we_1.get("designation") or "").strip()
-                previous_company     = (we_1.get("company") or "").strip()
+        # v2: collect ALL previous titles and companies
+        previous_titles:    List[str] = []
+        previous_companies: List[str] = []
 
-        # ── Education ─────────────────────────────────────────────────────────
+        if isinstance(we, list):
+            if len(we) > 0:
+                we_0 = we[0] if isinstance(we[0], dict) else {}
+                if not current_designation:
+                    current_designation = (we_0.get("designation") or "").strip()
+                if not current_company:
+                    current_company = (we_0.get("company") or "").strip()
+
+            # Previous entries: we[1] sets the single legacy fields,
+            # ALL we[1:] populate the new arrays
+            for idx, item in enumerate(we[1:], start=1):
+                if not isinstance(item, dict):
+                    continue
+                title   = (item.get("designation") or "").strip()
+                company = (item.get("company") or "").strip()
+
+                # Legacy single fields — only from we[1]
+                if idx == 1:
+                    previous_designation = title
+                    previous_company     = company
+
+                # New arrays — all entries
+                if title and title not in previous_titles:
+                    previous_titles.append(title)
+                if company and company not in previous_companies:
+                    previous_companies.append(company)
+
+        # ── Companies count (unique companies across all experience) ───────────
+        all_companies: List[str] = []
+        if current_company and current_company not in all_companies:
+            all_companies.append(current_company)
+        for c in previous_companies:
+            if c not in all_companies:
+                all_companies.append(c)
+        companies_count = len(all_companies)
+
+        # ── Education ──────────────────────────────────────────────────────────
         edu = row.get("education") or []
         if isinstance(edu, str):
             try:
@@ -189,13 +234,18 @@ class CandidateIndexer:
             except Exception:
                 edu = []
         education_summary = ""
+        degree            = ""
+        institution       = ""
         if isinstance(edu, list) and len(edu) > 0:
-            # SAFEGUARD: Ensure education item is a dict
             edu_0 = edu[0] if isinstance(edu[0], dict) else {}
-            education_summary = (edu_0.get("degree") or "").strip()
+            degree      = (edu_0.get("degree") or "").strip()
+            institution = (edu_0.get("institution") or "").strip()
+            # education_summary = degree + institution (for text search)
+            parts = [p for p in [degree, institution] if p]
+            education_summary = ", ".join(parts)
 
-        # ── Resume snippet (first 2000 chars) ────────────────────────────────
-        resume_text = row.get("resume_text") or ""
+        # ── Resume snippet (first 2000 chars) ─────────────────────────────────
+        resume_text    = row.get("resume_text") or ""
         resume_snippet = resume_text[:2000].strip()
 
         # ── Timestamp ─────────────────────────────────────────────────────────
@@ -214,12 +264,12 @@ class CandidateIndexer:
         except Exception:
             created_at_ts = 0
 
-        # ── Build document ────────────────────────────────────────────────────
+        # ── Build document ─────────────────────────────────────────────────────
         doc: Dict[str, Any] = {
-            "id":                   str(row["id"]),
-            "organization_id":      str(row["organization_id"]),
-            "full_name":            (row.get("candidate_name") or "").strip(),
-            "created_at_ts":        created_at_ts,
+            "id":              str(row["id"]),
+            "organization_id": str(row["organization_id"]),
+            "full_name":       (row.get("candidate_name") or "").strip(),
+            "created_at_ts":   created_at_ts,
         }
 
         # Optional fields — only include if non-empty
@@ -238,6 +288,16 @@ class CandidateIndexer:
         _set("notice_period",       row.get("notice_period"))
         _set("education_summary",   education_summary)
         _set("resume_snippet",      resume_snippet)
+        _set("degree",              degree)
+        _set("institution",         institution)
+
+        # New v2 arrays
+        if previous_titles:
+            doc["previous_titles"] = previous_titles
+        if previous_companies:
+            doc["previous_companies"] = previous_companies
+        if companies_count > 0:
+            doc["companies_count"] = companies_count
 
         if skills:
             doc["skills"] = skills
@@ -266,7 +326,7 @@ class CandidateIndexer:
 
         return doc
 
-    # ── Write operations ──────────────────────────────────────────────────────
+    # ── Write operations ───────────────────────────────────────────────────────
 
     async def upsert_document(self, row: Dict[str, Any]):
         """Upsert a single document (from webhook)."""

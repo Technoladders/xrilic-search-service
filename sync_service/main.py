@@ -1,14 +1,13 @@
 """
-xrilic-search-service / sync_service / main.py
+main.py — xrilic-search-service
+Flask app: webhook + full reindex + health + stats
 
-Responsibilities:
-  1. POST /webhook/talent-pool  — Supabase DB webhook on hr_talent_pool INSERT/UPDATE
-  2. POST /reindex              — Trigger full re-index (admin, protected)
-  3. GET  /health               — Liveness probe
-  4. Background task: polls Supabase every 60s for changed records
-
-Flow:
-  Supabase hr_talent_pool → this service → Typesense collection "candidates"
+COMPOSITE CURSOR FIX (Phase 2):
+  Naukri bulk imports create groups of 50 rows with identical created_at.
+  A single gt.{timestamp} cursor skips all rows after the first batch in each
+  group. Fix: composite cursor (created_at, id) using PostgREST OR filter:
+    or=(created_at.gt.{dt},and(created_at.eq.{dt},id.gt.{id}))
+    order=created_at.asc,id.asc
 """
 
 import asyncio
@@ -25,7 +24,7 @@ from fastapi.responses import JSONResponse
 from indexer import CandidateIndexer
 from poller import SyncPoller
 
-# ── Logging ──────────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -33,18 +32,18 @@ logging.basicConfig(
 logger = logging.getLogger("sync_service")
 
 # ── Config from env ───────────────────────────────────────────────────────────
-TYPESENSE_HOST     = os.environ["TYPESENSE_HOST"]       # e.g. typesense (container name)
-TYPESENSE_PORT     = int(os.environ.get("TYPESENSE_PORT", "8108"))
-TYPESENSE_API_KEY  = os.environ["TYPESENSE_API_KEY"]
-SUPABASE_URL       = os.environ["SUPABASE_URL"]
+TYPESENSE_HOST      = os.environ["TYPESENSE_HOST"]
+TYPESENSE_PORT      = int(os.environ.get("TYPESENSE_PORT", "8108"))
+TYPESENSE_API_KEY   = os.environ["TYPESENSE_API_KEY"]
+SUPABASE_URL        = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-WEBHOOK_SECRET     = os.environ["WEBHOOK_SECRET"]       # shared secret for webhook auth
-ADMIN_SECRET       = os.environ["ADMIN_SECRET"]         # for /reindex endpoint
-POLL_INTERVAL_SEC  = int(os.environ.get("POLL_INTERVAL_SEC", "60"))
+WEBHOOK_SECRET      = os.environ["WEBHOOK_SECRET"]
+ADMIN_SECRET        = os.environ["ADMIN_SECRET"]
+POLL_INTERVAL_SEC   = int(os.environ.get("POLL_INTERVAL_SEC", "60"))
 
 # ── Global instances ──────────────────────────────────────────────────────────
 indexer: CandidateIndexer = None
-poller: SyncPoller = None
+poller:  SyncPoller       = None
 
 
 @asynccontextmanager
@@ -60,11 +59,9 @@ async def lifespan(app: FastAPI):
         api_key=TYPESENSE_API_KEY,
     )
 
-    # Ensure Typesense collection exists (idempotent)
     await indexer.ensure_collection()
     logger.info("Typesense collection ready.")
 
-    # Start background poller
     poller = SyncPoller(
         indexer=indexer,
         supabase_url=SUPABASE_URL,
@@ -76,7 +73,6 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Shutdown
     if poller:
         poller.stop()
     logger.info("xrilic-search-service stopped.")
@@ -85,9 +81,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Xrilic Search Sync Service", lifespan=lifespan)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Health
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Health ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -95,9 +89,7 @@ async def health():
     return {"status": "ok", "typesense": ts_ok}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Webhook — Supabase fires this on INSERT / UPDATE to hr_talent_pool
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Webhook — Supabase fires this on INSERT / UPDATE to hr_talent_pool ────────
 
 @app.post("/webhook/talent-pool")
 async def webhook_talent_pool(
@@ -117,9 +109,9 @@ async def webhook_talent_pool(
     if x_webhook_secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    payload = await request.json()
+    payload    = await request.json()
     event_type = payload.get("type", "").upper()
-    record = payload.get("record")
+    record     = payload.get("record")
 
     if not record:
         return {"ok": True, "skipped": "no record"}
@@ -136,9 +128,7 @@ async def webhook_talent_pool(
     return {"ok": True}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Full Re-index (admin only)
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Full Re-index (admin only) ─────────────────────────────────────────────────
 
 @app.post("/reindex")
 async def trigger_reindex(
@@ -162,43 +152,65 @@ async def stats(x_admin_secret: str = Header(None)):
     if x_admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="Unauthorized")
     collection_stats = await indexer.get_stats()
-    poller_stats = poller.get_stats() if poller else {}
+    poller_stats     = poller.get_stats() if poller else {}
     return {"collection": collection_stats, "poller": poller_stats}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Full re-index helper
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Full re-index helper ───────────────────────────────────────────────────────
 
 async def run_full_reindex(supabase_url: str, supabase_key: str, indexer: CandidateIndexer):
-    logger.info("Starting full re-index with cursor-based pagination...")
+    """
+    Reads ALL records from hr_talent_pool in batches of 500.
+    Uses COMPOSITE CURSOR (created_at, id) to handle groups of rows
+    sharing the same created_at (Naukri bulk imports).
+
+    PostgREST OR filter pattern:
+      &or=(created_at.gt.{dt},and(created_at.eq.{dt},id.gt.{id}))
+      &order=created_at.asc,id.asc
+
+    This correctly pages past all duplicate-timestamp groups.
+    """
+    logger.info("Starting full re-index (composite cursor)...")
     headers = {
-        "apikey": supabase_key,
+        "apikey":        supabase_key,
         "Authorization": f"Bearer {supabase_key}",
     }
 
-    total = 0
-    # Start from the very beginning
-    last_cursor = "1970-01-01T00:00:00+00:00"  # epoch start
+    # Epoch start — will be replaced after first batch
+    last_dt = "1970-01-01T00:00:00+00:00"
+    last_id = "00000000-0000-0000-0000-000000000000"
+
+    total      = 0
     batch_size = 500
+
+    # Fields needed by transform_record — resume_text omitted to avoid 50MB+ batches
+    SELECT_FIELDS = (
+        "id,candidate_name,email,phone,suggested_title,"
+        "current_designation,current_company,current_location,"
+        "notice_period,top_skills,parsed_experience_years,"
+        "parsed_current_ctc,parsed_expected_ctc,organization_id,"
+        "created_at,work_experience,education"
+    )
 
     async with httpx.AsyncClient(timeout=60) as client:
         while True:
-            # URL-encode the '+' sign so Supabase doesn't read it as a space
-            safe_cursor = last_cursor.replace("+", "%2B")
-            
-            # KEY: gt. (greater than) on created_at — cursor advances each batch
+            # Encode + in ISO timestamp for URL safety
+            safe_dt = last_dt.replace("+", "%2B")
+
+            # Composite cursor OR filter — handles duplicate created_at groups
+            or_filter = (
+                f"or=(created_at.gt.{safe_dt},"
+                f"and(created_at.eq.{safe_dt},id.gt.{last_id}))"
+            )
+
             url = (
                 f"{supabase_url}/rest/v1/hr_talent_pool"
-                f"?select=id,candidate_name,email,phone,suggested_title,"
-                f"current_designation,current_company,current_location,"
-                f"notice_period,top_skills,parsed_experience_years,"
-                f"parsed_current_ctc,parsed_expected_ctc,organization_id,"
-                f"created_at,work_experience,education"
-                f"&created_at=gt.{safe_cursor}"
-                f"&order=created_at.asc"
+                f"?select={SELECT_FIELDS}"
+                f"&{or_filter}"
+                f"&order=created_at.asc,id.asc"
                 f"&limit={batch_size}"
             )
+
             resp = await client.get(url, headers=headers)
             resp.raise_for_status()
             records = resp.json()
@@ -212,14 +224,19 @@ async def run_full_reindex(supabase_url: str, supabase_key: str, indexer: Candid
             if docs:
                 await indexer.bulk_upsert(docs)
 
-            total += len(docs)
-            # Advance cursor to last record's created_at
-            last_cursor = records[-1]["created_at"]
-            logger.info(f"Re-index progress: {total} indexed, cursor={last_cursor}")
+            total    += len(docs)
+            last_dt   = records[-1]["created_at"]
+            last_id   = records[-1]["id"]
+
+            logger.info(
+                f"Re-index progress: {total} records indexed "
+                f"(cursor: {last_dt[:19]}, id: {last_id[:8]}...)"
+            )
 
             if len(records) < batch_size:
-                break  # Last page
+                break
 
+            # Avoid hammering Supabase
             await asyncio.sleep(0.2)
 
     logger.info(f"Full re-index complete: {total} total records.")
