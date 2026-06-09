@@ -1,9 +1,16 @@
 """
-indexer.py — v2.1 (crash fix)
-CRASH FIX: Some JSONB rows store designation/company/degree as a LIST instead of a
-string — e.g. ["Executive - Records Management"] — causing AttributeError: 'list'
-object has no attribute 'strip'.
-Added _to_str() helper used everywhere a string is extracted from JSONB.
+indexer.py — v2.2 (full resume text)
+CHANGES vs v2.1:
+  v2.2 — Full resume text indexing
+    • resume_snippet (2000 chars) → resume_full_text (100,000 chars)
+    • Rename field in COLLECTION_SCHEMA
+    • run_full_reindex SELECT_FIELDS now includes resume_text column
+    • All webhook upserts already include resume_text (row is the full record)
+    REQUIRES: POST /reindex after deploy to rebuild the index with the new field.
+
+  v2.1 — _to_str() crash fix
+    Some JSONB rows store designation/company/degree as a LIST instead of a
+    string — e.g. ["Executive - Records Management"] — causing AttributeError.
 """
 
 import json
@@ -17,16 +24,9 @@ logger = logging.getLogger("indexer")
 
 # ── Safe JSONB string extractor ────────────────────────────────────────────────
 def _to_str(val: Any) -> str:
-    """
-    Convert a JSONB field value to a clean string.
-    Handles: str, list (takes first element), int/float, None.
-    This is needed because some malformed records store designation/company/etc
-    as ["Value"] (a list) instead of "Value" (a string).
-    """
     if isinstance(val, str):
         return val.strip()
     if isinstance(val, (list, tuple)):
-        # Take first non-empty element
         for item in val:
             if item is not None:
                 s = str(item).strip()
@@ -53,7 +53,7 @@ COLLECTION_SCHEMA = {
         {"name": "current_company",      "type": "string",   "optional": True, "facet": True},
         {"name": "previous_designation", "type": "string",   "optional": True},
         {"name": "previous_company",     "type": "string",   "optional": True},
-        # ── v2: all past titles/companies ─────────────────────────────────────
+        # ── v2: all past titles / companies ─────────────────────────────────
         {"name": "previous_titles",      "type": "string[]", "optional": True},
         {"name": "previous_companies",   "type": "string[]", "optional": True},
         # ── Location ─────────────────────────────────────────────────────────
@@ -68,21 +68,28 @@ COLLECTION_SCHEMA = {
         {"name": "notice_period",        "type": "string",   "optional": True, "facet": True},
         # ── Education ────────────────────────────────────────────────────────
         {"name": "education_summary",    "type": "string",   "optional": True},
-        # ── v2: degree facet + institution ────────────────────────────────────
         {"name": "degree",               "type": "string",   "optional": True, "facet": True},
         {"name": "institution",          "type": "string",   "optional": True},
-        # ── v2: companies count ───────────────────────────────────────────────
+        # ── Companies count ───────────────────────────────────────────────────
         {"name": "companies_count",      "type": "int32",    "optional": True},
-        # ── Resume snippet (not stored, only indexed) ────────────────────────
-        {"name": "resume_snippet",       "type": "string",   "optional": True, "index": True, "store": False},
+        # ── v2.2: full resume text (indexed, NOT stored — store:false saves disk) ──
+        # Previously: resume_snippet (only first 2000 chars)
+        # Now: resume_full_text (up to 100,000 chars = ~99% of all resumes)
+        # search.hrumbles.ai only tokenises and inverts this — it is never
+        # returned in search hits, so bandwidth is unaffected.
+        {"name": "resume_full_text", "type": "string", "optional": True, "index": True, "store": False},
         # ── Sorting ──────────────────────────────────────────────────────────
-        {"name": "created_at_ts",        "type": "int64"},
+        {"name": "created_at_ts",    "type": "int64"},
     ],
     "default_sorting_field": "created_at_ts",
     "token_separators": ["+", "#", "."],
 }
 
-QUERY_BY_FIELDS  = "suggested_title,current_designation,current_company,previous_titles,previous_companies,skills,degree,institution,education_summary,resume_snippet"
+QUERY_BY_FIELDS  = (
+    "suggested_title,current_designation,current_company,"
+    "previous_titles,previous_companies,"
+    "skills,degree,institution,education_summary,resume_full_text"
+)
 QUERY_BY_WEIGHTS = "10,9,8,7,6,5,4,3,2,1"
 
 
@@ -137,8 +144,8 @@ class CandidateIndexer:
         Convert a hr_talent_pool row into a Typesense document.
         Returns None if the row is missing required fields.
 
-        CRASH FIX: uses _to_str() for all JSONB field extractions to handle
-        cases where fields contain lists instead of strings.
+        v2.2: resume_full_text now includes up to 100,000 chars of resume_text.
+        v2.1: _to_str() handles JSONB fields that are lists instead of strings.
         """
         if not row.get("id") or not row.get("organization_id"):
             return None
@@ -176,7 +183,6 @@ class CandidateIndexer:
         if not isinstance(we, list):
             we = []
 
-        # Start from DB columns (these are already strings or None)
         current_designation  = _to_str(row.get("current_designation"))
         current_company      = _to_str(row.get("current_company"))
         previous_designation = ""
@@ -185,10 +191,8 @@ class CandidateIndexer:
         previous_companies: List[str] = []
 
         if len(we) > 0:
-            # we[0] → current role (only fills in if DB columns are blank)
             we_0 = we[0] if isinstance(we[0], dict) else {}
             if not current_designation:
-                # FIX: _to_str handles the case where "designation" is a list
                 current_designation = _to_str(we_0.get("designation"))
             if not current_company:
                 current_company = _to_str(we_0.get("company"))
@@ -196,14 +200,11 @@ class CandidateIndexer:
         for idx, item in enumerate(we[1:], start=1):
             if not isinstance(item, dict):
                 continue
-            # FIX: _to_str on every field extraction from JSONB
             title   = _to_str(item.get("designation"))
             company = _to_str(item.get("company"))
-
             if idx == 1:
                 previous_designation = title
                 previous_company     = company
-
             if title and title not in previous_titles:
                 previous_titles.append(title)
             if company and company not in previous_companies:
@@ -233,15 +234,17 @@ class CandidateIndexer:
         institution       = ""
         if len(edu) > 0:
             edu_0 = edu[0] if isinstance(edu[0], dict) else {}
-            # FIX: _to_str on degree and institution (can be lists in malformed data)
             degree      = _to_str(edu_0.get("degree"))
             institution = _to_str(edu_0.get("institution"))
             parts = [p for p in [degree, institution] if p]
             education_summary = ", ".join(parts)
 
-        # ── Resume snippet ─────────────────────────────────────────────────────
-        resume_text    = row.get("resume_text") or ""
-        resume_snippet = resume_text[:2000].strip() if isinstance(resume_text, str) else ""
+        # ── Resume full text (v2.2) ────────────────────────────────────────────
+        # Index up to 100,000 chars. store:False means Typesense tokenises it
+        # for search but never returns it in hits — zero bandwidth impact.
+        # 100K covers essentially every resume (a typical 3-page resume is ~6KB).
+        resume_text     = row.get("resume_text") or ""
+        resume_full_text = resume_text[:100_000].strip() if isinstance(resume_text, str) else ""
 
         # ── Timestamp ─────────────────────────────────────────────────────────
         created_at_str = row.get("created_at") or "2020-01-01T00:00:00+00:00"
@@ -277,7 +280,7 @@ class CandidateIndexer:
         _set("current_location",     row.get("current_location"))
         _set("notice_period",        row.get("notice_period"))
         _set("education_summary",    education_summary)
-        _set("resume_snippet",       resume_snippet)
+        _set("resume_full_text",     resume_full_text)   # v2.2 (was resume_snippet)
         _set("degree",               degree)
         _set("institution",          institution)
 
@@ -290,12 +293,11 @@ class CandidateIndexer:
         if skills:
             doc["skills"] = skills
 
-        # Numeric fields
         exp = row.get("parsed_experience_years")
         if exp is not None:
             try:
                 v = int(exp)
-                if v >= 0:   # skip -1 sentinel values
+                if v >= 0:
                     doc["exp_years"] = v
             except (TypeError, ValueError):
                 pass
@@ -319,7 +321,7 @@ class CandidateIndexer:
     # ── Write operations ───────────────────────────────────────────────────────
 
     async def upsert_document(self, row: Dict[str, Any]):
-        """Upsert a single document (from webhook)."""
+        """Upsert a single document (from webhook). Row is the full record."""
         doc = self.transform_record(row)
         if not doc:
             logger.warning(f"Skipping upsert — transform returned None for row {row.get('id')}")
