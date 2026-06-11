@@ -159,6 +159,7 @@ async def run_full_reindex(supabase_url: str, supabase_key: str, indexer: Candid
         "parsed_current_ctc,parsed_expected_ctc,organization_id,"
         "created_at,work_experience,education,"
         "resume_text"  # ← v2.2 addition
+        "highest_education"
     )
 
     async with httpx.AsyncClient(timeout=120) as client:

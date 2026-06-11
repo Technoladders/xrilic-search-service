@@ -70,6 +70,8 @@ COLLECTION_SCHEMA = {
         # ── Education ────────────────────────────────────────────────────────
         {"name": "education_summary",    "type": "string",   "optional": True},
         {"name": "degree",               "type": "string",   "optional": True, "facet": True},
+        {"name": "highest_education",    "type": "string", "optional": True, "facet": True},
+        {"name": "all_degrees",          "type": "string[]", "optional": True, "facet": True},
         {"name": "institution",          "type": "string",   "optional": True},
         # ── Companies count ───────────────────────────────────────────────────
         {"name": "companies_count",      "type": "int32",    "optional": True},
@@ -220,7 +222,7 @@ class CandidateIndexer:
                 all_companies.append(c)
         companies_count = len(all_companies)
 
-        # ── Education ──────────────────────────────────────────────────────────
+# ── Education — full history ───────────────────────────────────────────
         edu = row.get("education") or []
         if isinstance(edu, str):
             try:
@@ -230,15 +232,36 @@ class CandidateIndexer:
         if not isinstance(edu, list):
             edu = []
 
-        education_summary = ""
-        degree            = ""
-        institution       = ""
-        if len(edu) > 0:
-            edu_0 = edu[0] if isinstance(edu[0], dict) else {}
-            degree      = _to_str(edu_0.get("degree"))
-            institution = _to_str(edu_0.get("institution"))
-            parts = [p for p in [degree, institution] if p]
-            education_summary = ", ".join(parts)
+        all_degrees:      List[str] = []
+        all_institutions: List[str] = []
+        degree      = ""
+        institution = ""
+
+        for idx, entry in enumerate(edu):
+            if not isinstance(entry, dict):
+                continue
+            deg  = _to_str(entry.get("degree"))
+            inst = _to_str(entry.get("institution"))
+            if deg and deg not in all_degrees:
+                all_degrees.append(deg)
+            if inst and inst not in all_institutions:
+                all_institutions.append(inst)
+            if idx == 0:          # first entry = primary degree / institution
+                degree      = deg
+                institution = inst
+
+        # highest_education flat column — authoritative, add at front if not duplicate
+        highest_education = _to_str(row.get("highest_education"))
+        if highest_education:
+            if highest_education not in all_degrees:
+                all_degrees.insert(0, highest_education)
+            if not degree:
+                degree = highest_education
+
+        # education_summary = all degrees + all institutions joined
+        # searched by keyword branch A (QB_KEYWORD_TEXT includes education_summary)
+        edu_parts     = all_degrees + all_institutions
+        education_summary = ", ".join(edu_parts) if edu_parts else ""
 
         # ── Resume full text (v2.2) ────────────────────────────────────────────
         # Index up to 100,000 chars. store:False means Typesense tokenises it
@@ -283,7 +306,9 @@ class CandidateIndexer:
         _set("education_summary",    education_summary)
         _set("resume_full_text",     resume_full_text)   # v2.2 (was resume_snippet)
         _set("degree",               degree)
+        _set("highest_education",    highest_education)
         _set("institution",          institution)
+        
 
         if previous_titles:
             doc["previous_titles"] = previous_titles
@@ -293,6 +318,8 @@ class CandidateIndexer:
             doc["companies_count"] = companies_count
         if skills:
             doc["skills"] = skills
+        if all_degrees:
+            doc["all_degrees"] = all_degrees
 
         exp = row.get("parsed_experience_years")
         if exp is not None:

@@ -129,6 +129,7 @@ class SyncPoller:
                     f"work_experience,"
                     f"education,"
                     f"resume_text"
+                    f"highest_education"
                     f"&{or_filter}"
                     f"&order=updated_at.asc,id.asc"
                     f"&limit={batch_size}"
