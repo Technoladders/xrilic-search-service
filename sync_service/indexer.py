@@ -15,6 +15,7 @@ CHANGES vs v2.1:
 
 import json
 import logging
+import asyncio
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -344,86 +345,105 @@ class CandidateIndexer:
             if r.status_code not in (200, 404):
                 logger.error(f"Delete failed for {doc_id}: {r.text}")
 
-async def bulk_upsert(self, docs: List[Dict[str, Any]]) -> bool:
-    """
-    Import a batch via Typesense bulk import.
-    
-    v2.3 CHANGES:
-      - Returns bool: True = success, False = Typesense unavailable (caller
-        should stop the poll cycle and not advance the cursor).
-      - Retries up to 3× on 503 / ReadTimeout / RemoteProtocolError
-        with 5s / 10s backoff.
-      - Timeout reduced from 120s → 30s (fail fast; batch is small enough).
-    """
-    if not docs:
-        return True
-
-    jsonl = "\n".join(json.dumps(d) for d in docs)
-
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=30) as c:
-                r = await c.post(
-                    f"{self.base_url}/collections/candidates/documents/import"
-                    f"?action=upsert&batch_size=100",
-                    headers={**self.headers, "Content-Type": "text/plain"},
-                    content=jsonl.encode("utf-8"),
-                )
-
-            if r.status_code == 503:
-                if attempt < 2:
-                    wait = 5 * (attempt + 1)  # 5s, 10s
-                    logger.warning(
-                        f"Bulk upsert 503 — Typesense lagging "
-                        f"(attempt {attempt + 1}/3), waiting {wait}s"
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                logger.warning(
-                    f"Bulk upsert: Typesense still 503 after 3 attempts — "
-                    f"skipping batch of {len(docs)} docs"
-                )
-                return False
-
-            if r.status_code != 200:
-                logger.error(
-                    f"Bulk upsert failed: {r.status_code} {r.text[:300]}"
-                )
-                return False
-
-            # Parse per-document results
-            errors = []
-            for line in r.text.strip().split("\n"):
-                try:
-                    result = json.loads(line)
-                    if not result.get("success"):
-                        errors.append(result)
-                except Exception:
-                    pass
-
-            if errors:
-                logger.warning(
-                    f"Bulk upsert: {len(errors)} doc errors out of {len(docs)}"
-                )
-                for e in errors[:5]:
-                    logger.warning(f"  → {e}")
-            else:
-                logger.info(f"Bulk upsert: {len(docs)} docs OK")
-
+    async def bulk_upsert(self, docs: List[Dict[str, Any]]) -> bool:
+        """
+        Returns True on success, False if Typesense is unavailable.
+        Retries 3× with backoff on transient failures.
+        """
+        if not docs:
             return True
 
-        except (httpx.ReadTimeout, httpx.RemoteProtocolError, httpx.ConnectError) as e:
-            if attempt < 2:
-                wait = 5 * (attempt + 1)
-                logger.warning(
-                    f"Bulk upsert connection error "
-                    f"(attempt {attempt + 1}/3): {type(e).__name__} — waiting {wait}s"
-                )
-                await asyncio.sleep(wait)
-                continue
-            logger.error(
-                f"Bulk upsert failed after 3 attempts: {type(e).__name__}"
-            )
-            return False
+        jsonl = "\n".join(json.dumps(d) for d in docs)
 
-    return False
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=30) as c:
+                    r = await c.post(
+                        f"{self.base_url}/collections/candidates/documents/import"
+                        f"?action=upsert&batch_size=100",
+                        headers={
+                            **self.headers,
+                            "Content-Type": "text/plain",
+                        },
+                        content=jsonl.encode("utf-8"),
+                    )
+
+                if r.status_code == 503:
+                    if attempt < 2:
+                        wait = 5 * (attempt + 1)
+                        logger.warning(
+                            f"Bulk upsert 503 "
+                            f"(attempt {attempt + 1}/3) "
+                            f"— waiting {wait}s"
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+
+                    logger.warning(
+                        "Bulk upsert still returning 503 "
+                        "after 3 attempts"
+                    )
+                    return False
+
+                if r.status_code != 200:
+                    logger.error(
+                        f"Bulk upsert failed: "
+                        f"{r.status_code} "
+                        f"{r.text[:300]}"
+                    )
+                    return False
+
+                errors = []
+
+                for line in r.text.strip().split("\n"):
+                    try:
+                        result = json.loads(line)
+
+                        if not result.get("success"):
+                            errors.append(result)
+
+                    except Exception:
+                        pass
+
+                if errors:
+                    logger.warning(
+                        f"Bulk upsert: "
+                        f"{len(errors)} errors out of {len(docs)}"
+                    )
+
+                    for e in errors[:5]:
+                        logger.warning(f"  → {e}")
+
+                else:
+                    logger.info(
+                        f"Bulk upsert: {len(docs)} docs OK"
+                    )
+
+                return True
+
+            except (
+                httpx.ReadTimeout,
+                httpx.RemoteProtocolError,
+                httpx.ConnectError,
+            ) as e:
+
+                if attempt < 2:
+                    wait = 5 * (attempt + 1)
+
+                    logger.warning(
+                        f"Bulk upsert "
+                        f"{type(e).__name__} "
+                        f"(attempt {attempt + 1}/3) "
+                        f"— waiting {wait}s"
+                    )
+
+                    await asyncio.sleep(wait)
+                    continue
+
+                logger.error(
+                    f"Bulk upsert failed after 3 attempts: "
+                    f"{type(e).__name__}"
+                )
+                return False
+
+        return False
