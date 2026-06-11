@@ -62,68 +62,84 @@ class SyncPoller:
                 logger.error(f"Poller error: {e}", exc_info=True)
             await asyncio.sleep(self.interval_sec)
 
-    async def _poll_once(self):
-        """
-        Fetch all hr_talent_pool rows updated since last_synced_at.
-        Upsert them into Typesense in batches of 500.
-        """
-        # Encode the '+' in the isoformat string
-        since = self.last_synced_at.isoformat().replace("+", "%2B")
-        poll_start = datetime.now(timezone.utc)
+async def _poll_once(self):
+    """
+    v2.3 CHANGES:
+      - Health check BEFORE polling — skip cycle if Typesense is not ready.
+        Prevents the poller from crashing Typesense during search load.
+      - Cursor not advanced on upsert failure — retried next cycle.
+    """
+    # ── Guard: skip entire cycle if Typesense is unhealthy ─────────────
+    if not await self.indexer.ping():
+        logger.warning("Typesense not healthy — skipping poll cycle (will retry next interval)")
+        return
 
-        headers = {
-            "apikey": self.supabase_key,
-            "Authorization": f"Bearer {self.supabase_key}",
-        }
+    since      = self.last_synced_at.isoformat().replace("+", "%2B")
+    poll_start = datetime.now(timezone.utc)
 
-        total_this_poll = 0
-        offset = 0
-        batch_size = 500
+    headers = {
+        "apikey": self.supabase_key,
+        "Authorization": f"Bearer {self.supabase_key}",
+    }
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            while True:
-                url = (
-                    f"{self.supabase_url}/rest/v1/hr_talent_pool"
-                    f"?select=id,candidate_name,email,phone,suggested_title,"
-                    f"current_designation,current_company,current_location,"
-                    f"notice_period,top_skills,parsed_experience_years,"
-                    f"parsed_current_ctc,parsed_expected_ctc,organization_id,"
-                    f"created_at,updated_at,work_experience,education"
-                    f"&updated_at=gt.{since}"
-                    f"&order=updated_at.asc"
-                    f"&offset={offset}&limit={batch_size}"
-                )
+    total_this_poll = 0
+    offset          = 0
+    batch_size      = 500
 
-                resp = await client.get(url, headers=headers)
-                resp.raise_for_status()
-                records = resp.json()
+    async with httpx.AsyncClient(timeout=60) as client:
+        while True:
+            url = (
+                f"{self.supabase_url}/rest/v1/hr_talent_pool"
+                f"?select=id,candidate_name,email,phone,suggested_title,"
+                f"current_designation,current_company,current_location,"
+                f"notice_period,top_skills,parsed_experience_years,"
+                f"parsed_current_ctc,parsed_expected_ctc,organization_id,"
+                f"created_at,updated_at,work_experience,education,"
+                f"resume_text"
+                f"&updated_at=gt.{since}"
+                f"&order=updated_at.asc"
+                f"&offset={offset}&limit={batch_size}"
+            )
 
-                if not records:
-                    break
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            records = resp.json()
 
-                docs = [
-                    self.indexer.transform_record(r)
-                    for r in records
-                    if r.get("id")
-                ]
-                docs = [d for d in docs if d is not None]
+            if not records:
+                break
 
-                if docs:
-                    await self.indexer.bulk_upsert(docs)
+            docs = [
+                self.indexer.transform_record(r)
+                for r in records
+                if r.get("id")
+            ]
+            docs = [d for d in docs if d is not None]
 
-                total_this_poll += len(docs)
-                offset += batch_size
+            if docs:
+                success = await self.indexer.bulk_upsert(docs)
+                if not success:
+                    # Typesense became unhealthy mid-cycle — stop now.
+                    # Cursor is NOT advanced, so these records will be
+                    # retried on the next healthy poll cycle.
+                    logger.warning(
+                        "Bulk upsert failed — stopping poll cycle early. "
+                        "Cursor not advanced; records will be retried next interval."
+                    )
+                    return
 
-                if len(records) < batch_size:
-                    break
+            total_this_poll += len(docs)
+            offset += batch_size
 
-                await asyncio.sleep(0.1)
+            if len(records) < batch_size:
+                break
 
-        if total_this_poll > 0:
-            logger.info(f"Poller: synced {total_this_poll} updated records.")
+            await asyncio.sleep(0.1)
 
-        self._total_synced     += total_this_poll
-        self._last_poll_count   = total_this_poll
-        self._last_poll_time    = poll_start
-        # Advance cursor only after successful poll
-        self.last_synced_at     = poll_start
+    if total_this_poll > 0:
+        logger.info(f"Poller: synced {total_this_poll} updated records.")
+
+    self._total_synced    += total_this_poll
+    self._last_poll_count  = total_this_poll
+    self._last_poll_time   = poll_start
+    # Only advance cursor after a fully successful cycle
+    self.last_synced_at    = poll_start
