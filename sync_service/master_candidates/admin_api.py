@@ -1,0 +1,151 @@
+"""
+sync_service/master_candidates/admin_api.py
+
+FastAPI router mounted at /mc/admin.
+POST /mc/admin/control              — set desired_state / config (superadmin JWT)
+GET  /mc/admin/status               — dashboard payload (uses get_mc_process_status RPC)
+POST /mc/admin/index/reindex-ids    — force-reindex specific master_candidates ids
+POST /mc/admin/synonyms/reload      — reload synonyms from Supabase to Typesense
+POST /mc/webhook/naukri-inserted    — called by naukri-save edge fn after RPC succeeds
+POST /mc/webhook/master-changed     — optional realtime hook if you add a DB trigger later
+
+Auth model matches your existing main.py:
+  - /webhook/... require X-Webhook-Secret header
+  - /admin/... require Authorization: Bearer <supabase JWT>, then RPC-side superadmin gate
+"""
+
+import logging
+from typing import Any
+
+import httpx
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+
+from .config import (
+    SB_HEADERS, SUPABASE_REST, HTTP_TIMEOUT_SUPABASE, WEBHOOK_SECRET,
+)
+from .indexer import index_ids
+from .typesense_client import sync_synonyms
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/mc", tags=["master_candidates_admin"])
+
+
+# ── Auth deps ──────────────────────────────────────────────────────────────
+def require_webhook(x_webhook_secret: str | None = Header(None)) -> None:
+    if x_webhook_secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=401, detail="invalid webhook secret")
+
+
+def require_admin(authorization: str | None = Header(None)) -> str:
+    """Extracts the Supabase JWT. Enforcement happens on the RPC we call
+    (SECURITY DEFINER checks global_superadmin). Same shape as existing main.py."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="missing bearer token")
+    return authorization[len("Bearer "):]
+
+
+# ── Admin: read dashboard status ───────────────────────────────────────────
+@router.get("/admin/status")
+async def admin_status(token: str = Depends(require_admin)) -> dict[str, Any]:
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_REST}/rpc/get_mc_process_status",
+            headers={
+                "apikey":        SB_HEADERS["apikey"],
+                "Authorization": f"Bearer {token}",  # user JWT — RLS applies
+                "Content-Type":  "application/json",
+            },
+            json={},
+            timeout=HTTP_TIMEOUT_SUPABASE,
+        )
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.text[:400])
+    return r.json()
+
+
+# ── Admin: set control state ───────────────────────────────────────────────
+@router.post("/admin/control")
+async def admin_control(request: Request, token: str = Depends(require_admin)) -> dict[str, Any]:
+    payload = await request.json()
+    process = payload.get("process")
+    if process not in ("ingest", "index"):
+        raise HTTPException(status_code=400, detail="process must be 'ingest' or 'index'")
+    body = {
+        "p_process":            process,
+        "p_desired_state":      payload.get("desired_state"),
+        "p_poll_interval_sec":  payload.get("poll_interval_sec"),
+        "p_batch_size":         payload.get("batch_size"),
+        "p_concurrency":        payload.get("concurrency"),
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            f"{SUPABASE_REST}/rpc/set_mc_process_control",
+            headers={
+                "apikey":        SB_HEADERS["apikey"],
+                "Authorization": f"Bearer {token}",
+                "Content-Type":  "application/json",
+            },
+            json=body,
+            timeout=HTTP_TIMEOUT_SUPABASE,
+        )
+    if r.status_code >= 400:
+        raise HTTPException(status_code=r.status_code, detail=r.text[:400])
+    return {"ok": True, "row": r.json()}
+
+
+# ── Admin: force reindex specific ids ──────────────────────────────────────
+@router.post("/admin/index/reindex-ids")
+async def admin_reindex_ids(request: Request, token: str = Depends(require_admin)) -> dict[str, Any]:
+    payload = await request.json()
+    ids: list[str] = list(payload.get("ids") or [])
+    if not ids or len(ids) > 500:
+        raise HTTPException(status_code=400, detail="ids: 1-500 items")
+    async with httpx.AsyncClient() as client:
+        ok, errors = await index_ids(client, ids)
+    return {"ok": True, "indexed": ok, "errors_count": len(errors),
+            "first_errors": errors[:3]}
+
+
+# ── Admin: reload synonyms ────────────────────────────────────────────────
+@router.post("/admin/synonyms/reload")
+async def admin_synonyms_reload(token: str = Depends(require_admin)) -> dict[str, Any]:
+    async with httpx.AsyncClient() as client:
+        count = await sync_synonyms(client)
+    return {"ok": True, "synonyms_synced": count}
+
+
+# ── Webhook: naukri-save posts here AFTER merge_naukri_candidates succeeds ─
+@router.post("/webhook/naukri-inserted", dependencies=[Depends(require_webhook)])
+async def webhook_naukri_inserted(request: Request) -> dict[str, Any]:
+    """
+    Called by the naukri-save Supabase edge function after each successful
+    merge_naukri_candidates call. Payload: { "naukri_ids": ["uuid1", ...] }
+    This endpoint:
+      1. Enqueues an in-process ingest task (naukri → master)  [Milestone 4]
+      2. Once ingest lands the master row(s), the polling indexer picks them
+         up on the next tick — OR we can trigger indexing directly here for
+         lower latency once ingest is proven.
+
+    Milestone 1: this endpoint is a no-op that logs. Wired-up in Milestone 4.
+    """
+    payload = await request.json()
+    naukri_ids = payload.get("naukri_ids") or []
+    logger.info(f"[mc-webhook] naukri-inserted: {len(naukri_ids)} ids (deferred to poll)")
+    return {"ok": True, "queued": len(naukri_ids), "note": "ingest wired in M4"}
+
+
+# ── Webhook: master_candidates row changed (optional trigger-driven path) ─
+@router.post("/webhook/master-changed", dependencies=[Depends(require_webhook)])
+async def webhook_master_changed(request: Request) -> dict[str, Any]:
+    """
+    Optional low-latency path. If you add a Supabase trigger on
+    master_candidates that pg_net.http_post's the row id here, we index it
+    within seconds instead of waiting for the poll cycle.
+    """
+    payload = await request.json()
+    ids = payload.get("ids") or []
+    if not ids:
+        return {"ok": True, "indexed": 0}
+    async with httpx.AsyncClient() as client:
+        ok, errors = await index_ids(client, ids[:500])
+    return {"ok": True, "indexed": ok, "errors_count": len(errors)}

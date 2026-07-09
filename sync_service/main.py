@@ -29,6 +29,14 @@ from fastapi.responses import JSONResponse
 from indexer import CandidateIndexer
 from poller import SyncPoller
 
+from master_candidates import (
+    config as mc_config,
+    typesense_client as mc_ts,
+    indexer as mc_indexer,
+    search_api as mc_search,
+    admin_api as mc_admin,
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -51,25 +59,77 @@ poller:  SyncPoller       = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global indexer, poller
+
     logger.info("Starting xrilic-search-service...")
+
+    # ------------------------------------------------------------------
+    # Existing Zive-X Search setup
+    # ------------------------------------------------------------------
+
     indexer = CandidateIndexer(
-        host=TYPESENSE_HOST, port=TYPESENSE_PORT, api_key=TYPESENSE_API_KEY,
+        host=TYPESENSE_HOST,
+        port=TYPESENSE_PORT,
+        api_key=TYPESENSE_API_KEY,
     )
+
     await indexer.ensure_collection()
+
     logger.info("Typesense collection ready.")
+
     poller = SyncPoller(
-        indexer=indexer, supabase_url=SUPABASE_URL,
-        supabase_key=SUPABASE_SERVICE_KEY, interval_sec=POLL_INTERVAL_SEC,
+        indexer=indexer,
+        supabase_url=SUPABASE_URL,
+        supabase_key=SUPABASE_SERVICE_KEY,
+        interval_sec=POLL_INTERVAL_SEC,
     )
-    asyncio.create_task(poller.run())
+
+    zx_poller_task = asyncio.create_task(poller.run())
+
     logger.info(f"Poller started (interval={POLL_INTERVAL_SEC}s).")
+
+    # ------------------------------------------------------------------
+    # NEW: Master Candidates setup
+    # ------------------------------------------------------------------
+
+    async with httpx.AsyncClient() as client:
+        await mc_ts.ensure_collection(client)
+        synonym_count = await mc_ts.sync_synonyms(client)
+        logger.info(f"[mc] booted, {synonym_count} synonyms loaded")
+
+    mc_index_task = None
+
+    if mc_config.INDEX_ENABLED:
+        mc_index_task = asyncio.create_task(
+            mc_indexer.run_index_loop()
+        )
+        logger.info("[mc] index loop started")
+    else:
+        logger.info(
+            "[mc] index loop DISABLED via MC_INDEX_ENABLED=false"
+        )
+
+    # ------------------------------------------------------------------
+
     yield
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+
     if poller:
         poller.stop()
+
+    zx_poller_task.cancel()
+
+    if mc_index_task:
+        mc_index_task.cancel()
+
     logger.info("xrilic-search-service stopped.")
 
 
 app = FastAPI(title="Xrilic Search Sync Service", lifespan=lifespan)
+app.include_router(mc_search.router)
+app.include_router(mc_admin.router)
 
 
 @app.get("/health")

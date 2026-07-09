@@ -30,6 +30,13 @@ services:
       WEBHOOK_SECRET:        ${WEBHOOK_SECRET}
       ADMIN_SECRET:          ${ADMIN_SECRET}
       POLL_INTERVAL_SEC:     "60"
+      
+      # Master Candidates
+      MC_INGEST_ENABLED:     "false"
+      MC_INDEX_ENABLED:      "true"
+      MC_POLL_INTERVAL_SEC:  "60"
+      MC_BATCH_SIZE:         "500"
+      MC_COLLECTION_NAME:    "master_candidates_v1"
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -66,7 +73,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 4G
+          memory: 6G
 
 volumes:
   typesense-data:

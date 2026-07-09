@@ -70,13 +70,20 @@ jobs:
             docker pull ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
             docker pull typesense/typesense:27.1
 
-                        echo "→ Writing .env..."
+            echo "→ Writing .env..."
             echo "DOCKER_TAG=${{ env.DOCKER_TAG }}" > .env
             echo "TYPESENSE_API_KEY=${{ secrets.TYPESENSE_API_KEY }}" >> .env
             echo "SUPABASE_URL=${{ secrets.SUPABASE_URL }}" >> .env
             echo "SUPABASE_SERVICE_KEY=${{ secrets.SUPABASE_SERVICE_KEY }}" >> .env
             echo "WEBHOOK_SECRET=${{ secrets.SEARCH_WEBHOOK_SECRET }}" >> .env
             echo "ADMIN_SECRET=${{ secrets.SEARCH_ADMIN_SECRET }}" >> .env
+
+            # Master Candidates
+            echo "MC_INGEST_ENABLED=false" >> .env
+            echo "MC_INDEX_ENABLED=true" >> .env
+            echo "MC_POLL_INTERVAL_SEC=60" >> .env
+            echo "MC_BATCH_SIZE=500" >> .env
+            echo "MC_COLLECTION_NAME=master_candidates_v1" >> .env
 
             echo "→ Restarting containers..."
             docker compose up -d --force-recreate --remove-orphans
