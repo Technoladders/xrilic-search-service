@@ -253,6 +253,7 @@ def map_row(row: dict[str, Any]) -> dict[str, Any]:
         "current_ctc_display":    row.get("current_ctc_display"),
         "notice_period_display":  row.get("notice_period_display"),
         "total_experience_months": exp_months or None,
+        "last_active_date":       row.get("naukri_active_date"),
         "experience_display":     row.get("experience_display"),
         "preferred_locations":    row.get("preferred_locations_array") or [],
         "current_location":       row.get("current_location"),

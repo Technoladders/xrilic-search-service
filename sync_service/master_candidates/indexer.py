@@ -7,6 +7,7 @@ Two things live here:
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -27,7 +28,8 @@ SELECT_COLUMNS = ",".join([
     "id","primary_source","sources","linkedin_url","full_name","title","headline",
     "summary","profile_picture_url","location","country","industry","seniority",
     "followers","company_name","current_location","functional_area","role",
-    "skills","experience","education","certifications","languages","contact_availability","preferred_locations",
+    "skills","experience","education","certifications","languages","contact_availability",
+    "available_emails","available_phones","preferred_locations",
     "current_ctc_lacs","expected_ctc_lacs","current_ctc_display",
     "notice_period_days","notice_period_display",
     "total_experience_months","experience_display",
@@ -120,6 +122,13 @@ def transform_row(row: dict[str, Any]) -> dict[str, Any]:
         "contact_personal_email": bool((row.get("contact_availability") or {}).get("personal_email")),
         "contact_phone":          bool((row.get("contact_availability") or {}).get("phone")),
         "summary_full":           _truncate(row.get("summary"), 4000),
+
+        "experience_json":     json.dumps((row.get("experience") or [])[:20], ensure_ascii=False),
+        "education_json":      json.dumps((row.get("education") or [])[:10], ensure_ascii=False),
+        "certifications_json": json.dumps((row.get("certifications") or [])[:15], ensure_ascii=False),
+        "emails_json":         json.dumps(row.get("available_emails") or [], ensure_ascii=False),
+        "phones_json":         json.dumps(row.get("available_phones") or [], ensure_ascii=False),
+
         "linkedin_url":            row.get("linkedin_url"),
         "profile_picture_url":     row.get("profile_picture_url"),
         "current_ctc_display":     row.get("current_ctc_display"),

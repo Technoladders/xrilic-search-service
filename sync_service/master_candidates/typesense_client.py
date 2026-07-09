@@ -85,6 +85,11 @@ COLLECTION_SCHEMA: dict[str, Any] = {
         {"name": "contact_personal_email","type": "bool",     "optional": True, "index": False},
         {"name": "contact_phone",         "type": "bool",     "optional": True, "index": False},
         {"name": "summary_full",          "type": "string",   "optional": True, "index": False},
+        {"name": "experience_json",        "type": "string",   "optional": True, "index": False},
+        {"name": "education_json",         "type": "string",   "optional": True, "index": False},
+        {"name": "certifications_json",    "type": "string",   "optional": True, "index": False},
+        {"name": "emails_json",            "type": "string",   "optional": True, "index": False},
+        {"name": "phones_json",            "type": "string",   "optional": True, "index": False},
     ],
 }
 
@@ -109,6 +114,11 @@ NEW_FIELDS = [
     {"name": "contact_personal_email", "type": "bool",     "optional": True, "index": False},
     {"name": "contact_phone",          "type": "bool",     "optional": True, "index": False},
     {"name": "summary_full",           "type": "string",   "optional": True, "index": False},
+    {"name": "experience_json",        "type": "string",   "optional": True, "index": False},
+    {"name": "education_json",         "type": "string",   "optional": True, "index": False},
+    {"name": "certifications_json",    "type": "string",   "optional": True, "index": False},
+    {"name": "emails_json",            "type": "string",   "optional": True, "index": False},
+    {"name": "phones_json",            "type": "string",   "optional": True, "index": False},
 ]
 
 async def ensure_fields(client: httpx.AsyncClient) -> None:
