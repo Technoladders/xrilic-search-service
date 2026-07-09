@@ -110,10 +110,13 @@ def _build_filter_by(f: dict[str, Any]) -> str:
 
 
 def _to_rr_profile(hit: dict[str, Any]) -> dict[str, Any]:
-    """Normalize a Typesense hit into the RRProfile shape the frontend expects.
-    (Contact fields left as availability-only — actual emails/phones come from
-     Supabase on candidate detail view.)"""
+    """Normalize a Typesense hit into the RRProfile shape the frontend expects."""
     d = hit.get("document", {})
+    contact_avail = {
+        "personal_email": bool(d.get("contact_personal_email")),
+        "phone":          bool(d.get("contact_phone")),
+        "work_email":     False,
+    }
     return {
         "id":               d["id"],
         "status":           "complete",
@@ -125,14 +128,37 @@ def _to_rr_profile(hit: dict[str, Any]) -> dict[str, Any]:
         "linkedin_url":     d.get("linkedin_url"),
         "profile_pic":      d.get("profile_picture_url"),
         "connections":      d.get("followers"),
-        "_skills":          d.get("skills") or [],
-        "_jobHistory":      [],   # detail view fills this from Supabase
-        "_education":       [],
-        "_allEmails":       [],
-        "_allPhones":       [],
-        "_enriched":        bool(d.get("has_contact")),
-        "_is_cached":       True,
-        "_provider":        "internal",
+
+        # ── top-level passthrough keys for normalizeInternalRow ──
+        "experience_display":      d.get("experience_display"),
+        "current_ctc_display":     d.get("current_ctc_display"),
+        "notice_period_display":   d.get("notice_period_display"),
+        "preferred_locations":     d.get("preferred_locations") or [],
+        "last_active_date":        d.get("last_active_date"),
+        "seniority":               d.get("seniority"),
+        "headline":                d.get("headline"),
+        "summary":                 d.get("summary_full") or d.get("summary_short"),
+        "languages":               d.get("languages") or [],
+        "total_experience_months": d.get("total_experience_months"),
+        "has_full_profile":        bool(d.get("has_full_profile")),
+        "contact_availability":    contact_avail,
+
+        "teaser": {
+            "emails":              ["available"] if contact_avail["personal_email"] else [],
+            "personal_emails":     ["available"] if contact_avail["personal_email"] else [],
+            "professional_emails": [],
+            "phones":              [{"number": "available", "is_premium": False}]
+                                   if contact_avail["phone"] else [],
+        },
+
+        "_skills":     d.get("skills") or [],
+        "_jobHistory": [],
+        "_education":  [],
+        "_allEmails":  [],
+        "_allPhones":  [],
+        "_enriched":   bool(d.get("has_contact")),
+        "_is_cached":  True,
+        "_provider":   "internal",
         "_internal": {
             "masterId":           d["id"],
             "experienceDisplay":  d.get("experience_display"),
@@ -143,7 +169,9 @@ def _to_rr_profile(hit: dict[str, Any]) -> dict[str, Any]:
             "preferredLocations": d.get("preferred_locations") or [],
             "seniority":          d.get("seniority"),
             "headline":           d.get("headline"),
-            "summary":            d.get("summary_short"),
+            "summary":            d.get("summary_full") or d.get("summary_short"),
+            "lastActiveDate":     d.get("last_active_date"),
+            "languages":          d.get("languages") or [],
         },
         "_score": hit.get("text_match"),
     }

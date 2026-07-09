@@ -80,6 +80,11 @@ COLLECTION_SCHEMA: dict[str, Any] = {
         {"name": "current_ctc_display",  "type": "string", "optional": True, "index": False},
         {"name": "experience_display",   "type": "string", "optional": True, "index": False},
         {"name": "notice_period_display","type": "string", "optional": True, "index": False},
+        {"name": "languages",             "type": "string[]", "optional": True, "index": False},
+        {"name": "last_active_date",      "type": "string",   "optional": True, "index": False},
+        {"name": "contact_personal_email","type": "bool",     "optional": True, "index": False},
+        {"name": "contact_phone",         "type": "bool",     "optional": True, "index": False},
+        {"name": "summary_full",          "type": "string",   "optional": True, "index": False},
     ],
 }
 
@@ -97,6 +102,31 @@ QUERY_BY_WEIGHTS = ",".join([
     "2", "1",             # headline, summary
     "2", "2", "1", "1",   # schools, degrees, fields, certs
 ])
+
+NEW_FIELDS = [
+    {"name": "languages",              "type": "string[]", "optional": True, "index": False},
+    {"name": "last_active_date",       "type": "string",   "optional": True, "index": False},
+    {"name": "contact_personal_email", "type": "bool",     "optional": True, "index": False},
+    {"name": "contact_phone",          "type": "bool",     "optional": True, "index": False},
+    {"name": "summary_full",           "type": "string",   "optional": True, "index": False},
+]
+
+async def ensure_fields(client: httpx.AsyncClient) -> None:
+    """Alter existing collection to add any missing retrieve-only fields."""
+    r = await client.get(f"{TYPESENSE_BASE}/collections/{TS_COLLECTION}",
+                         headers=TS_HEADERS, timeout=HTTP_TIMEOUT_TYPESENSE)
+    r.raise_for_status()
+    existing = {f["name"] for f in r.json().get("fields", [])}
+    missing = [f for f in NEW_FIELDS if f["name"] not in existing]
+    if not missing:
+        return
+    r = await client.patch(
+        f"{TYPESENSE_BASE}/collections/{TS_COLLECTION}",
+        headers=TS_HEADERS, json={"fields": missing},
+        timeout=60.0,   # alter walks existing docs; give it time
+    )
+    r.raise_for_status()
+    logger.info(f"typesense: added fields {[f['name'] for f in missing]}")
 
 
 async def ensure_collection(client: httpx.AsyncClient) -> None:

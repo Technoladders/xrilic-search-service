@@ -27,7 +27,7 @@ SELECT_COLUMNS = ",".join([
     "id","primary_source","sources","linkedin_url","full_name","title","headline",
     "summary","profile_picture_url","location","country","industry","seniority",
     "followers","company_name","current_location","functional_area","role",
-    "skills","experience","education","certifications","preferred_locations",
+    "skills","experience","education","certifications","languages","contact_availability","preferred_locations",
     "current_ctc_lacs","expected_ctc_lacs","current_ctc_display",
     "notice_period_days","notice_period_display",
     "total_experience_months","experience_display",
@@ -114,6 +114,12 @@ def transform_row(row: dict[str, Any]) -> dict[str, Any]:
         "data_freshness_ts":       _to_ts(row.get("data_freshness") or row.get("updated_at")),
         "last_active_date_ts":     _to_ts(row.get("last_active_date")),
 
+        "languages":              [l.get("name") for l in (row.get("languages") or [])
+                                   if isinstance(l, dict) and l.get("name")],
+        "last_active_date":       str(row.get("last_active_date")) if row.get("last_active_date") else None,
+        "contact_personal_email": bool((row.get("contact_availability") or {}).get("personal_email")),
+        "contact_phone":          bool((row.get("contact_availability") or {}).get("phone")),
+        "summary_full":           _truncate(row.get("summary"), 4000),
         "linkedin_url":            row.get("linkedin_url"),
         "profile_picture_url":     row.get("profile_picture_url"),
         "current_ctc_display":     row.get("current_ctc_display"),
