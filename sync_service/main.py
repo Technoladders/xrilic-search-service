@@ -35,6 +35,7 @@ from master_candidates import (
     indexer as mc_indexer,
     search_api as mc_search,
     admin_api as mc_admin,
+    ingest as mc_ingest,
 )
 
 logging.basicConfig(
@@ -97,12 +98,21 @@ async def lifespan(app: FastAPI):
         logger.info(f"[mc] booted, {synonym_count} synonyms loaded")
 
     mc_index_task = None
+    mc_ingest_task = None
 
     if mc_config.INDEX_ENABLED:
         mc_index_task = asyncio.create_task(
             mc_indexer.run_index_loop()
         )
         logger.info("[mc] index loop started")
+    else:
+        logger.info("[mc] index loop DISABLED via MC_INDEX_ENABLED=false")
+        
+    if mc_config.INGEST_ENABLED:
+        mc_ingest_task = asyncio.create_task(
+            mc_ingest.run_ingest_loop()
+        )
+        logger.info("[mc] ingest loop started")
     else:
         logger.info(
             "[mc] index loop DISABLED via MC_INDEX_ENABLED=false"
@@ -123,6 +133,9 @@ async def lifespan(app: FastAPI):
 
     if mc_index_task:
         mc_index_task.cancel()
+        
+    if mc_ingest_task:
+        mc_ingest_task.cancel()
 
     logger.info("xrilic-search-service stopped.")
 

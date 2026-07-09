@@ -25,6 +25,7 @@ from .config import (
 )
 from .indexer import index_ids
 from .typesense_client import sync_synonyms
+from .ingest import WEBHOOK_QUEUE
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mc", tags=["master_candidates_admin"])
@@ -117,22 +118,27 @@ async def admin_synonyms_reload(token: str = Depends(require_admin)) -> dict[str
 # ── Webhook: naukri-save posts here AFTER merge_naukri_candidates succeeds ─
 @router.post("/webhook/naukri-inserted", dependencies=[Depends(require_webhook)])
 async def webhook_naukri_inserted(request: Request) -> dict[str, Any]:
-    """
-    Called by the naukri-save Supabase edge function after each successful
-    merge_naukri_candidates call. Payload: { "naukri_ids": ["uuid1", ...] }
-    This endpoint:
-      1. Enqueues an in-process ingest task (naukri → master)  [Milestone 4]
-      2. Once ingest lands the master row(s), the polling indexer picks them
-         up on the next tick — OR we can trigger indexing directly here for
-         lower latency once ingest is proven.
-
-    Milestone 1: this endpoint is a no-op that logs. Wired-up in Milestone 4.
-    """
     payload = await request.json()
-    naukri_ids = payload.get("naukri_ids") or []
-    logger.info(f"[mc-webhook] naukri-inserted: {len(naukri_ids)} ids (deferred to poll)")
-    return {"ok": True, "queued": len(naukri_ids), "note": "ingest wired in M4"}
 
+    naukri_ids = [
+        str(x)
+        for x in (payload.get("naukri_ids") or [])
+        if x
+    ]
+
+    queued = 0
+
+    for nid in naukri_ids[:1000]:
+        try:
+            WEBHOOK_QUEUE.put_nowait(nid)
+            queued += 1
+        except Exception:
+            break
+
+    return {
+        "ok": True,
+        "queued": queued,
+    }
 
 # ── Webhook: master_candidates row changed (optional trigger-driven path) ─
 @router.post("/webhook/master-changed", dependencies=[Depends(require_webhook)])

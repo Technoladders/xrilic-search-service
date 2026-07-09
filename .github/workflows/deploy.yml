@@ -79,7 +79,7 @@ jobs:
             echo "ADMIN_SECRET=${{ secrets.SEARCH_ADMIN_SECRET }}" >> .env
 
             # Master Candidates
-            echo "MC_INGEST_ENABLED=false" >> .env
+            echo "MC_INGEST_ENABLED=true" >> .env
             echo "MC_INDEX_ENABLED=true" >> .env
             echo "MC_POLL_INTERVAL_SEC=60" >> .env
             echo "MC_BATCH_SIZE=500" >> .env
