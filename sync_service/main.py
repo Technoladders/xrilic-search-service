@@ -25,6 +25,7 @@ from typing import Any
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from indexer import CandidateIndexer
 from poller import SyncPoller
@@ -115,7 +116,7 @@ async def lifespan(app: FastAPI):
         logger.info("[mc] ingest loop started")
     else:
         logger.info(
-            "[mc] index loop DISABLED via MC_INDEX_ENABLED=false"
+            "[mc] ingest loop DISABLED via MC_INGEST_ENABLED=false"
         )
 
     # ------------------------------------------------------------------
@@ -141,6 +142,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Xrilic Search Sync Service", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(mc_search.router)
 app.include_router(mc_admin.router)
 
