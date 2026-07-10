@@ -18,13 +18,13 @@ import logging
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 
 from .config import (
     SB_HEADERS, SUPABASE_REST, HTTP_TIMEOUT_SUPABASE, WEBHOOK_SECRET,
 )
 from .indexer import index_ids
-from .typesense_client import sync_synonyms
+from .typesense_client import sync_synonyms, ensure_fields
 from .ingest import WEBHOOK_QUEUE
 
 logger = logging.getLogger(__name__)
@@ -113,6 +113,24 @@ async def admin_synonyms_reload(token: str = Depends(require_admin)) -> dict[str
     async with httpx.AsyncClient() as client:
         count = await sync_synonyms(client)
     return {"ok": True, "synonyms_synced": count}
+
+
+
+@router.post("/admin/schema/ensure-fields")
+async def admin_ensure_fields(
+    background_tasks: BackgroundTasks,
+    token: str = Depends(require_admin),
+) -> dict[str, Any]:
+    async def _run():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                await ensure_fields(client)
+            logger.info("[mc] ensure_fields (manual trigger) completed")
+        except Exception as e:
+            logger.exception(f"[mc] ensure_fields failed: {e}")
+    background_tasks.add_task(_run)
+    return {"ok": True, "message": "Schema migration started in background — "
+                                    "watch logs or poll GET /mc/health."}
 
 
 # ── Webhook: naukri-save posts here AFTER merge_naukri_candidates succeeds ─

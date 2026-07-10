@@ -95,9 +95,10 @@ async def lifespan(app: FastAPI):
 
     async with httpx.AsyncClient() as client:
         await mc_ts.ensure_collection(client)
-        await mc_ts.ensure_fields(client)          # ← add this line
         synonym_count = await mc_ts.sync_synonyms(client)
         logger.info(f"[mc] booted, {synonym_count} synonyms loaded")
+    logger.info("[mc] schema fields NOT auto-migrated on boot — "
+                "trigger manually via POST /mc/admin/schema/ensure-fields")
 
     mc_index_task = None
     mc_ingest_task = None
