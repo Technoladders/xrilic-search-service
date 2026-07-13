@@ -7,45 +7,38 @@ POST /mc/search   — takes the InternalFilters payload from useInternalSearch.t
                     count_capped }
 GET  /mc/health   — collection stats
 
-v2 CHANGES (this file only — no schema change, no reindex; last_active_date_ts
-            and data_freshness_ts already exist and are populated):
+v3 CHANGE (this file only, this turn — everything else identical to the
+previous delivered version):
 
-  RANKING (this turn's fix):
-    _build_filter_by() was ALREADY correct for nice-skill inclusion — nice
-    skills sit in filter_by as an OR (`skills:=[a,b,c]`, via _filter_any),
-    same as before. What was missing: nothing counted HOW MANY nice skills
-    each profile matched, so a profile matching all 3 sorted identically to
-    one matching just 1. Typesense's sort_by can't do array-intersection-
-    count natively, so:
-      • when nice skills are present, we fetch a bounded pool (see
-        RERANK_POOL_HARD_CAP) and compute the exact match count in Python,
-        then sort by (match_count desc, keyword relevance desc,
-        last_active_date_ts desc, data_freshness_ts desc).
-      • when there are no nice skills, Typesense's native sort_by handles
-        everything in one call — just with the field order corrected:
-        last_active_date_ts now leads (most recently active first),
-        data_freshness_ts (sync recency) is the tiebreaker. Previously
-        data_freshness_ts was primary, which is the wrong field for "most
-        recently active first."
+  TOTAL-COUNT HONESTY + GRACEFUL OVERFLOW, in the nice-skill branch of
+  search(). Previously, when more profiles matched than
+  RERANK_POOL_HARD_CAP, the response reported "total": RERANK_POOL_HARD_CAP
+  (e.g. 1000) even when the true count was higher (e.g. 2230) — understating
+  how many candidates actually match. Now:
+    • "total" is ALWAYS the true Typesense `found` count, never capped.
+    • Exact nice-skill match-count ranking still only extends
+      RERANK_POOL_HARD_CAP deep (unchanged — that's a real performance
+      tradeoff, not something removed).
+    • Pages beyond that depth are fetched DIRECTLY from Typesense (still
+      respecting the nice-skill OR filter, so every result genuinely
+      matches), ordered by the native sort_by (last_active_date_ts desc,
+      data_freshness_ts desc) instead of exact match-count. No page a user
+      clicks to ever comes back empty because of the pool boundary.
+    • "count_capped" now means "beyond this page, ordering is recency-based
+      rather than exact nice-skill-count" — still real results, just a
+      different (still correct) ordering past that depth.
 
-  CARRIED FORWARD from earlier in this conversation (separate from the
-  ranking ask, but same file, so included here — flagged distinctly):
-    • ids lookup short-circuit: {"ids": [...]} in the payload returns those
-      profiles directly. Powers fetchMasterProfilesByIds() (job-sourcing
-      card hydration) — the real file had no support for this at all, so
-      that payload fell through to q="*" and returned arbitrary profiles.
+  v2 CHANGES (carried from before, unchanged):
+    RANKING: nice skills rank by exact match count (computed in Python over
+    a bounded pool, since Typesense can't count OR-filter matches natively).
+    sort_by leads with last_active_date_ts (most recently active first),
+    data_freshness_ts as tiebreaker.
+
+  CARRIED FORWARD (also unchanged, same file):
+    • ids lookup short-circuit ({"ids": [...]}) — job-sourcing card hydration.
     • SECURITY: exclude_fields=emails_json,phones_json on every Typesense
-      call. _to_rr_profile() is UNCHANGED — but since Typesense now never
-      returns those two fields, _loads(d.get("emails_json")) naturally
-      resolves to [], so _allEmails/_allPhones/_enriched come out safe
-      automatically. contact_availability/teaser booleans still work
-      because they also read the separate contact_personal_email /
-      contact_phone boolean fields, which are NOT excluded.
-
-  IMPORTANT — frontend: any client-side .sort() added after receiving
-  /mc/search results must be removed. It would re-scramble this ordering,
-  and it only ever sees one page at a time so it can't reproduce the
-  pool-based nice-skill ranking correctly anyway.
+      call. _to_rr_profile() naturally produces empty/False contacts once
+      Typesense never returns those two fields.
 """
 
 import json as _json
@@ -76,12 +69,11 @@ EXCLUDE_FIELDS = "emails_json,phones_json"
 # math, since offset = (page-1)*per_page using the CURRENT call's per_page).
 TYPESENSE_MAX_PER_PAGE = 250
 
-# Safety ceiling for how deep nice-skill match-count reranking goes. Typical
-# loads (page 1-20 at the existing 50/page cap = up to 1000) cost exactly
-# ONE Typesense call when total matches are under ~250, growing by one more
-# call per extra 250. Beyond this cap, results are still returned but
-# "count_capped": true is set on the response so the frontend can surface
-# a "narrow your search for more" hint if it wants to.
+# How deep EXACT nice-skill match-count ranking goes. This is a performance
+# bound, NOT a results-count bound — "total" in the response is always the
+# true count regardless of this cap (see the v3 fix above). At the existing
+# per_page cap of 50, this covers 20 pages of exactly-ranked results before
+# falling back to recency ordering for anything deeper.
 RERANK_POOL_HARD_CAP = 1000
 
 
@@ -111,10 +103,7 @@ def _filter_none_skills(values: list[str]) -> str | None:
 
 
 def _extract_skill_chips(f: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
-    """(must, nice, exclude) labels from filters.skillChips.
-    Pulled out into its own function so search() can reuse the same `nice`
-    list that _build_filter_by() uses — pure refactor, identical logic to
-    what was previously inlined in _build_filter_by, no behavior change."""
+    """(must, nice, exclude) labels from filters.skillChips."""
     chips = f.get("skillChips") or []
     must    = [c["label"] for c in chips if c.get("mode") == "must" and c.get("label")]
     nice    = [c["label"] for c in chips if c.get("mode") == "nice" and c.get("label")]
@@ -208,8 +197,7 @@ def _to_rr_profile(hit: dict[str, Any]) -> dict[str, Any]:
     # emails_json/phones_json are excluded from Typesense retrieval
     # (EXCLUDE_FIELDS) — d.get(...) resolves to None here, so _loads(None)
     # returns [], and everything downstream (emails/phones/_allEmails/
-    # _allPhones/_enriched) comes out empty/False automatically. No other
-    # change needed in this function for the contact strip to hold.
+    # _allPhones/_enriched) comes out empty/False automatically.
     raw_emails = _loads(d.get("emails_json"))
     raw_phones = _loads(d.get("phones_json"))
 
@@ -244,6 +232,8 @@ def _to_rr_profile(hit: dict[str, Any]) -> dict[str, Any]:
         "degree":      e.get("degree") or "",
         "field":       e.get("field_of_study") or "",
         "major":       e.get("field_of_study") or "",
+        "start_date_year": e.get("start_date_year"),
+        "end_date_year":   e.get("end_date_year"),
         "period":      f"{e.get('start_date_year') or ''} - {e.get('end_date_year') or ''}"
                        if (e.get("start_date_year") or e.get("end_date_year")) else "",
     } for e in education if isinstance(e, dict)]
@@ -332,9 +322,6 @@ async def require_user(authorization: str | None = Header(None)) -> str:
 
 
 async def _ts_search(ts_params: dict[str, Any]) -> dict[str, Any]:
-    """Single GET to Typesense's search endpoint. Same behavior as the
-    inline call that used to live directly in search() — pulled into a
-    function so both the simple path and the pool-fetch loop can share it."""
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{TYPESENSE_BASE}/collections/{TS_COLLECTION}/documents/search",
@@ -352,13 +339,9 @@ async def _fetch_rerank_pool(
     """
     Fetches Typesense pages (fixed per_page=TYPESENSE_MAX_PER_PAGE — must
     stay constant across calls, since Typesense's offset math is
-    (page-1)*per_page using the CURRENT call's per_page; changing it
-    mid-loop would skip or repeat rows) until `needed` hits are collected,
-    the pool exhausts, or RERANK_POOL_HARD_CAP is reached.
-
-    Returns (hits, total_found, facet_counts, took_ms). facets/took_ms are
-    captured from the first page only — recomputing them on every
-    pool-extension call would add cost for no real benefit.
+    (page-1)*per_page using the CURRENT call's per_page) until `needed` hits
+    are collected, the pool exhausts, or RERANK_POOL_HARD_CAP is reached.
+    Returns (hits, total_found, facet_counts, took_ms).
     """
     hits: list[dict] = []
     found = 0
@@ -388,8 +371,6 @@ async def search(request: Request, user_id: str = Depends(require_user)) -> dict
     payload = await request.json()
 
     # ── ids lookup short-circuit — job-sourcing card hydration ────────────
-    # fetchMasterProfilesByIds() POSTs {"ids": [...]}. Returns those exact
-    # profiles, contact-stripped the same as a normal search.
     ids = [str(i) for i in (payload.get("ids") or []) if i][:100]
     if ids:
         ts_params = {
@@ -416,7 +397,7 @@ async def search(request: Request, user_id: str = Depends(require_user)) -> dict
     per_page = min(50, max(1, int(payload.get("per_page", 25))))
 
     q = (filters.get("keyword") or "").strip() or "*"
-    _, nice, _ = _extract_skill_chips(filters)   # same list _build_filter_by used for the OR filter
+    _, nice, _ = _extract_skill_chips(filters)
 
     filter_by = _build_filter_by(filters)
 
@@ -424,16 +405,12 @@ async def search(request: Request, user_id: str = Depends(require_user)) -> dict
         "q":                q,
         "query_by":         QUERY_BY,
         "query_by_weights": QUERY_BY_WEIGHTS,
-        "num_typos":        "2,1,0,0,0,0,0,0,0,0,0,0",  # only allow typos on name & title
+        "num_typos":        "2,1,0,0,0,0,0,0,0,0,0,0",
         "prioritize_exact_match": "true",
         "facet_by":         "has_full_profile,has_contact,sources,seniority,country,primary_source",
         "max_facet_values": "10",
         "highlight_fields": "full_name,title,skills_text",
         "exclude_fields":   EXCLUDE_FIELDS,
-        # v2 SORT: most recently active first, sync freshness as tiebreak.
-        # (Previously data_freshness_ts was primary — wrong field for "most
-        # recently active first.") This sort_by also determines which
-        # profiles enter the rerank pool below, when nice skills are used.
         "sort_by": (
             "_text_match:desc,last_active_date_ts:desc,data_freshness_ts:desc"
             if q != "*" else
@@ -458,40 +435,56 @@ async def search(request: Request, user_id: str = Depends(require_user)) -> dict
             "count_capped": False,
         }
 
-    # ── Nice-skill path: filter_by already restricts to "at least one nice
-    # skill" (OR, via _build_filter_by/_filter_any) — that part was already
-    # correct. What Typesense can't do is sort by HOW MANY of those matched.
-    # Fetch a bounded pool, then rank in Python:
-    #   1. most nice skills matched (desc)               ← the actual fix
-    #   2. keyword relevance, if a keyword was given too (desc)
-    #   3. most recently active (desc)
-    #   4. sync freshness (desc)
+    # ── Nice-skill path ────────────────────────────────────────────────────
     needed = page * per_page
-    hits, found, facets, took_ms = await _fetch_rerank_pool(base_params, needed)
 
-    nice_lower = {s.lower() for s in nice}
+    if needed <= RERANK_POOL_HARD_CAP:
+        # Fully exact-ranked: fetch the pool, count-rank in Python, slice.
+        hits, found, facets, took_ms = await _fetch_rerank_pool(base_params, needed)
 
-    def _rank_key(hit: dict[str, Any]) -> tuple:
-        doc = hit.get("document", {})
-        skills_lower = {str(s).lower() for s in (doc.get("skills") or [])}
-        match_count = len(skills_lower & nice_lower)
-        text_match = hit.get("text_match") or 0
-        last_active = doc.get("last_active_date_ts") or 0
-        freshness = doc.get("data_freshness_ts") or 0
-        return (-match_count, -text_match, -last_active, -freshness)
+        nice_lower = {s.lower() for s in nice}
 
-    hits_sorted = sorted(hits, key=_rank_key)
-    page_hits = hits_sorted[(page - 1) * per_page: page * per_page]
+        def _rank_key(hit: dict[str, Any]) -> tuple:
+            doc = hit.get("document", {})
+            skills_lower = {str(s).lower() for s in (doc.get("skills") or [])}
+            match_count = len(skills_lower & nice_lower)
+            text_match = hit.get("text_match") or 0
+            last_active = doc.get("last_active_date_ts") or 0
+            freshness = doc.get("data_freshness_ts") or 0
+            return (-match_count, -text_match, -last_active, -freshness)
 
-    pool_capped = found > RERANK_POOL_HARD_CAP
+        hits_sorted = sorted(hits, key=_rank_key)
+        page_hits = hits_sorted[(page - 1) * per_page: page * per_page]
+
+        return {
+            "profiles":     [_to_rr_profile(h) for h in page_hits],
+            # v3 FIX: always the TRUE count — never capped to the pool size.
+            "total":        found,
+            "page":         page,
+            "per_page":     per_page,
+            "facets":       facets,
+            "took_ms":      took_ms,
+            # true only if the true count exceeds what we exact-rank; pages
+            # beyond this depth (below) still return real, filter-matching
+            # results — just ordered by recency, not exact nice-skill count.
+            "count_capped": found > RERANK_POOL_HARD_CAP,
+        }
+
+    # ── v3 FIX: page requested is beyond the exact-rank pool. Fetch THIS
+    # SPECIFIC page directly from Typesense — still respects the nice-skill
+    # OR filter (every result genuinely matches), just ordered by the native
+    # sort_by (recency) instead of exact match-count this deep. This is what
+    # keeps deep pagination from ever returning an empty/broken page.
+    ts_params = {**base_params, "page": page, "per_page": per_page}
+    data = await _ts_search(ts_params)
     return {
-        "profiles":     [_to_rr_profile(h) for h in page_hits],
-        "total":        (RERANK_POOL_HARD_CAP if pool_capped else found),
+        "profiles":     [_to_rr_profile(h) for h in (data.get("hits") or [])],
+        "total":        data.get("found", 0),
         "page":         page,
         "per_page":     per_page,
-        "facets":       facets,
-        "took_ms":      took_ms,
-        "count_capped": pool_capped,
+        "facets":       data.get("facet_counts", []),
+        "took_ms":      data.get("search_time_ms"),
+        "count_capped": True,
     }
 
 
