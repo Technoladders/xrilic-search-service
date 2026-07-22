@@ -43,6 +43,8 @@ previous delivered version):
 
 import json as _json
 import logging
+import re as _re
+import time as _time
 from typing import Any, Optional
 
 import httpx
@@ -111,6 +113,57 @@ def _extract_skill_chips(f: dict[str, Any]) -> tuple[list[str], list[str], list[
     return must, nice, exclude
 
 
+def _parse_years_bucket(v: Any) -> tuple[Optional[int], Optional[int]]:
+    """
+    'yearsExperience' arrives as the bucket string the sidebar sends
+    (e.g. "0_1", "3_5", "10"), matching YEARS_OPTIONS in
+    SourceXRSearchSidebar.tsx. Previously this function looked for
+    "yearsMin"/"yearsMax" keys that are never sent by the frontend at all,
+    so the filter silently did nothing on /mc/search. Returns
+    (min_years, max_years); "10" (10+ years) has no upper bound.
+    """
+    if not v or not isinstance(v, str):
+        return None, None
+    if v == "10":
+        return 10, None
+    m = _re.match(r"^(\d+)_(\d+)$", v)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+# Day-range boundaries for the Activity filter, matching ACTIVITY_OPTIONS in
+# SourceXRSearchSidebar.tsx exactly (Fresh/Active/Recent/Aging/Stale).
+ACTIVITY_DAY_RANGES: dict[str, tuple[int, Optional[int]]] = {
+    "Fresh":  (0, 14),
+    "Active": (15, 30),
+    "Recent": (31, 45),
+    "Aging":  (46, 60),
+    "Stale":  (60, None),
+}
+
+
+def _activity_filter(category: Any) -> Optional[str]:
+    """
+    Real backend predicate for the Activity filter. Filters on
+    last_active_date_ts (int64, already live in the Typesense collection —
+    confirmed, not assumed). Bounds are inclusive day counts converted to a
+    unix-seconds window measured back from "now"; a smaller day count means
+    more recent, i.e. a larger timestamp, hence the swapped comparison
+    directions vs. the day range itself.
+    """
+    if not category or category not in ACTIVITY_DAY_RANGES:
+        return None
+    days_min, days_max = ACTIVITY_DAY_RANGES[category]
+    now = int(_time.time())
+    ts_upper = now - (days_min * 86400)
+    parts = [f"last_active_date_ts:<={ts_upper}"]
+    if days_max is not None:
+        ts_lower = now - (days_max * 86400)
+        parts.append(f"last_active_date_ts:>={ts_lower}")
+    return " && ".join(parts)
+
+
 def _build_filter_by(f: dict[str, Any]) -> str:
     parts: list[str] = []
 
@@ -155,12 +208,23 @@ def _build_filter_by(f: dict[str, Any]) -> str:
     if p := _filter_any("degrees", f.get("degree") or []):
         parts.append(p)
 
-    # years min/max (in months)
-    y_min, y_max = f.get("yearsMin"), f.get("yearsMax")
-    if y_min not in (None, ""):
-        parts.append(f"total_experience_months:>={int(y_min)*12}")
-    if y_max not in (None, ""):
-        parts.append(f"total_experience_months:<={int(y_max)*12}")
+    # years of experience — FIX: previously read "yearsMin"/"yearsMax",
+    # keys the frontend never sends (it sends "yearsExperience" as a
+    # bucket string like "3_5" or "10"). That mismatch meant this filter
+    # silently did nothing on /mc/search.
+    y_min, y_max = _parse_years_bucket(f.get("yearsExperience"))
+    if y_min is not None:
+        parts.append(f"total_experience_months:>={y_min*12}")
+    if y_max is not None:
+        parts.append(f"total_experience_months:<={y_max*12}")
+
+    # activity — FIX: was frontend-only (client-side post-filter on the
+    # current page only, per SourceXRSearchSidebar.tsx's prior header
+    # comment). Now a real predicate on last_active_date_ts so it actually
+    # narrows what the server returns and the total count, not just what's
+    # shown on the current page.
+    if p := _activity_filter(f.get("activityCategory")):
+        parts.append(p)
 
     if f.get("hasContactOnly"):
         parts.append("has_contact:=true")
