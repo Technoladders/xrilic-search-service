@@ -138,6 +138,7 @@ ACTIVITY_DAY_RANGES: dict[str, tuple[int, Optional[int]]] = {
     "Fresh":  (0, 14),
     "Active": (15, 30),
     "Recent": (31, 45),
+    "OpenToWork": (0, 45),
     "Aging":  (46, 60),
     "Stale":  (60, None),
 }
