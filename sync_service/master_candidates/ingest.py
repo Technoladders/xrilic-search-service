@@ -1,18 +1,31 @@
 """
 sync_service/master_candidates/ingest.py
 
-Ingest worker: naukri_candidates → master_candidates.
+Ingest worker: naukri_candidates -> master_candidates.
 
 Two entry paths:
-  1. FAST PATH  — /mc/webhook/naukri-inserted pushes ids into WEBHOOK_QUEUE;
+  1. FAST PATH  - /mc/webhook/naukri-inserted pushes ids into WEBHOOK_QUEUE;
                   worker drains it within seconds of a capture.
-  2. CURSOR POLL — (updated_at, id) cursor over naukri_candidates catches
+  2. CURSOR POLL - (updated_at, id) cursor over naukri_candidates catches
                   everything (inserts AND full-profile updates), including
                   anything the webhook missed. This is the source of truth.
 
-Identity resolution & merge stay in Postgres (ingest_master_candidate RPC,
-mean ~60ms/call) — this worker does the field mapping in Python and drives
-concurrency, which is the part that was burning Supabase edge-function CPU.
+Identity resolution & merge stay in Postgres (ingest_master_candidate RPC) -
+this worker does the field mapping in Python and drives concurrency, which is
+the part that was burning Supabase edge-function CPU.
+
+IMPORTANT: ingest_master_candidate's real signature (confirmed via
+`select proname, oid::regprocedure from pg_proc where proname =
+'ingest_master_candidate'`) is `ingest_master_candidate(p_source text,
+p_source_row_id text, p_payload jsonb)` - a single flat jsonb payload, NOT
+separate p_identifiers/p_profile/p_emails/p_phones/p_organization_id/
+p_raw_payload parameters. map_row() below builds p_payload with the exact
+field names supabase/functions/ingest-portal-a-to-master/index.ts's
+buildPayload() uses, since that's what the RPC body was written against
+(every field it reads is `p_payload->>'field_name'` or `p_payload->'field_name'`).
+A previous version of this file posted an 8-key body that doesn't match any
+RPC overload - every call 404'd (PGRST202/42883), silently, forever, while
+this worker looked "alive" in its own heartbeat/run-log.
 """
 
 import asyncio
@@ -38,6 +51,8 @@ WEBHOOK_QUEUE: asyncio.Queue[str] = asyncio.Queue(maxsize=10_000)
 
 MONTHS = {m: i + 1 for i, m in enumerate(
     ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"])}
+
+LINKEDIN_URL_RE = re.compile(r"https?://(?:www\.)?linkedin\.com/in/[^\s\"'<>)]+", re.IGNORECASE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +82,53 @@ def norm_phone_e164(v: Any) -> Optional[str]:
     if len(digits) >= 11:                      # already has some country code
         return f"+{digits}"
     return None
+
+
+def extract_linkedin_url(text: Any) -> Optional[str]:
+    if not text:
+        return None
+    m = LINKEDIN_URL_RE.search(str(text))
+    if not m:
+        return None
+    return re.sub(r"[.,;]+$", "", m.group(0))
+
+
+def derive_seniority(months: Optional[int]) -> Optional[str]:
+    if not months or months <= 0:
+        return None
+    if months < 24:
+        return "entry"
+    if months < 72:
+        return "mid"
+    if months < 144:
+        return "senior"
+    if months < 240:
+        return "lead"
+    return "executive"
+
+
+def derive_completeness(payload: dict[str, Any]) -> float:
+    """0-1 rubric score, NOT authoritative - used for ranking/freshness only.
+    Mirrors the Deno buildPayload()'s deriveCompleteness() exactly."""
+    scalar_fields = [
+        "full_name", "title", "headline", "summary", "location",
+        "company_name", "current_ctc_display", "gender", "dob",
+        "total_experience_months", "seniority",
+    ]
+    count = 0
+    for f in scalar_fields:
+        v = payload.get(f)
+        if v not in (None, "", 0):
+            count += 1
+    if payload.get("experience"):        count += 2
+    if payload.get("education"):         count += 2
+    if payload.get("skills"):            count += 1
+    if payload.get("languages"):         count += 1
+    if payload.get("structured_skills"): count += 1
+    if payload.get("available_emails"):  count += 2
+    if payload.get("available_phones"):  count += 2
+    max_score = len(scalar_fields) + 2 + 2 + 1 + 1 + 1 + 2 + 2
+    return round((count / max_score) * 100) / 100
 
 
 def _parse_month_year(tok: str) -> tuple[int, int]:
@@ -203,90 +265,163 @@ def build_languages(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Row → ingest_master_candidate payload
+# Row → ingest_master_candidate(p_source, p_source_row_id, p_payload) payload
+#
+# p_payload's field names mirror
+# supabase/functions/ingest-portal-a-to-master/index.ts's buildPayload()
+# exactly - that's the contract the RPC body was written against. Do NOT
+# rename fields here without also checking the RPC still reads them.
 # ─────────────────────────────────────────────────────────────────────────────
 def map_row(row: dict[str, Any]) -> dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
     email = norm_email(row.get("email"))
     phone = norm_phone_e164(row.get("phone"))
 
-    identifiers: dict[str, Any] = {}
-    if row.get("encrypted_username"):
-        identifiers["naukri_encrypted_username"] = str(row["encrypted_username"])
-    if row.get("naukri_user_id"):
-        identifiers["naukri_user_id"] = str(row["naukri_user_id"])
-    if email:
-        identifiers["email_normalized"] = email
-    if phone:
-        identifiers["phone_e164"] = phone
-
-    skills = [str(s) for s in (row.get("key_skills_array") or []) if s]
     about = str(row.get("about") or "").strip()
     work_summary = str(row.get("work_summary") or "").strip()
     summary = " ".join(x for x in [about, work_summary] if x) or None
 
     exp_months = row.get("exp_total_months") or 0
+    exp_years  = round((exp_months / 12) * 10) / 10 if exp_months else None
 
-    profile: dict[str, Any] = {
+    skills = [str(s) for s in (row.get("key_skills_array") or []) if s]
+    functional_area = row.get("functional_area")
+
+    available_emails = ([{
+        "value": email, "type": "personal", "source": SOURCE,
+        "verified": bool(row.get("email_verified")),
+        "confidence": 1.0, "added_at": now_iso,
+    }] if email else [])
+    available_phones = ([{
+        "value": phone, "type": "mobile", "source": SOURCE,
+        "verified": bool(row.get("phone_verified")),
+        "confidence": 1.0, "added_at": now_iso,
+    }] if phone else [])
+
+    structured_skills = [
+        {
+            "skill":     s.get("skill")     if isinstance(s, dict) else None,
+            "exp_txt":   s.get("exp_txt")   if isinstance(s, dict) else None,
+            "version":   s.get("version")   if isinstance(s, dict) else None,
+            "last_used": s.get("last_used") if isinstance(s, dict) else None,
+            "source":    SOURCE,
+        }
+        for s in (row.get("it_skills") or []) if isinstance(s, dict)
+    ]
+
+    payload: dict[str, Any] = {
+        # identifiers
+        "linkedin_url":                extract_linkedin_url(about) or extract_linkedin_url(work_summary),
+        "li_vanity":                   None,
+        "apollo_person_id":            None,
+        "rocketreach_id":              None,
+        "portal_a_encrypted_username": row.get("encrypted_username"),
+        "portal_a_sid":                row.get("sid") or row.get("parent_sid"),
+        "portal_a_user_id":            str(row["naukri_user_id"]) if row.get("naukri_user_id") else None,
+        "portal_a_res_id":             str(row["naukri_res_id"]) if row.get("naukri_res_id") else None,
+
+        # matching contact points (used by the resolver, not stored as-is)
+        "primary_email": row.get("email"),
+        "primary_phone": row.get("phone"),
+
+        # core profile
         "full_name":            row.get("name"),
         "title":                row.get("curr_designation"),
-        "headline":             about[:220] or None,
+        "headline":             (about[:220] or None),
         "summary":              summary,
         "profile_picture_url":  row.get("photo_url"),
         "location":             row.get("current_location"),
         "country":              "India",
         "industry":             row.get("industry"),
-        "functional_area":      row.get("functional_area"),
-        "role":                 row.get("role"),
-        "seniority": ("entry" if exp_months < 24 else
-                      "mid" if exp_months < 72 else
-                      "senior" if exp_months < 144 else "lead") if exp_months else None,
-        "company":              {"name": row.get("curr_organization")} if row.get("curr_organization") else None,
-        "company_name":         row.get("curr_organization"),
-        "experience":           build_experience(row),
-        "education":            build_education(row),
-        "skills":               skills,
-        "certifications":       row.get("certifications_array") or row.get("certifications") or [],
-        "languages":            build_languages(row),
+        "job_function":         functional_area.split("-")[0].strip() if functional_area else None,
+        "seniority":            derive_seniority(exp_months),
+        "work_status":          None,
+        "followers":            None,
+
+        # current company
+        "company":          {"name": row.get("curr_organization")} if row.get("curr_organization") else {},
+        "company_name":     row.get("curr_organization"),
+        "company_domain":   None,
+        "company_industry": row.get("industry"),
+        "company_size":     None,
+
+        # multi-entry arrays
+        "experience":               build_experience(row),
+        "education":                build_education(row),
+        "skills":                   skills,
+        "certifications":           row.get("certifications_array") or row.get("certifications") or [],
+        "publications":             [],
+        "projects":                 row.get("projects") or [],
+        "languages":                build_languages(row),
+        "volunteering_experiences": [],
+        "awards":                   [],
+        "may_also_know_skills":     row.get("may_also_know_skills") or [],
+        "structured_skills":        structured_skills,
+
+        # contact
         "contact_availability": {
-            "personal_email": bool(email), "phone": bool(phone), "work_email": False},
+            "phone": bool(phone), "work_email": False, "personal_email": bool(email)},
+        "available_emails": available_emails,
+        "available_phones": available_phones,
+
+        # recruitment extras
+        "current_ctc_lacs":        row.get("current_ctc_lacs"),
+        "expected_ctc_lacs":       row.get("expected_ctc_lacs"),
         "current_ctc_display":    row.get("current_ctc_display"),
+        "notice_period_days":     None,
         "notice_period_display":  row.get("notice_period_display"),
+        "total_experience_years":  exp_years,
         "total_experience_months": exp_months or None,
-        "last_active_date":       row.get("naukri_active_date"),
         "experience_display":     row.get("experience_display"),
         "preferred_locations":    row.get("preferred_locations_array") or [],
         "current_location":       row.get("current_location"),
+        "functional_area":        functional_area,
+        "role":                   row.get("role"),
         "resume_url":             row.get("cv_download_url") or row.get("resume_file_url"),
+        "resume_text":            None,
         "resume_last_updated":    row.get("resume_last_updated"),
         "gender":            row.get("gender"),
         "dob":               row.get("dob"),
         "marital_status":    row.get("marital_status"),
         "category":          row.get("category"),
+        "disability":        row.get("disability"),
         "desired_job_type":  row.get("desired_job_type"),
         "employment_status_pref": row.get("employment_status_pref"),
         "work_auth_countries":    row.get("work_auth_countries") or [],
-        "may_also_know_skills":   row.get("may_also_know_skills") or [],
-        "has_full_profile":       bool(row.get("has_full_profile")),
-    }
-    profile = {k: v for k, v in profile.items() if v is not None}
 
-    emails = ([{"value": email, "type": "personal", "source": SOURCE,
-                "verified": bool(row.get("email_verified")),
-                "confidence": 1.0, "added_at": now_iso}] if email else [])
-    phones = ([{"value": phone, "type": "mobile", "source": SOURCE,
-                "verified": bool(row.get("phone_verified")),
-                "confidence": 1.0, "added_at": now_iso}] if phone else [])
+        # meta
+        "has_full_profile": bool(row.get("has_full_profile")),
+        "data_freshness":  (row.get("updated_at") or row.get("search_batch_at")
+                             or row.get("localdb_profile_at") or row.get("resdex_profile_at")
+                             or row.get("captured_at") or now_iso),
+        "last_active_date": row.get("naukri_active_date"),
+
+        # kept lean - naukri_candidates remains the source-of-truth for raw HTML/JSON
+        "raw_metadata": {
+            "source_row_id":      str(row.get("id")),
+            "encrypted_username": row.get("encrypted_username"),
+            "captured_from":      row.get("captured_from"),
+            "captured_at":        row.get("captured_at"),
+            "search_batch_at":    row.get("search_batch_at"),
+            "localdb_profile_at": row.get("localdb_profile_at"),
+            "resdex_profile_at":  row.get("resdex_profile_at"),
+            "first_captured_via": row.get("first_captured_via"),
+            "last_captured_via":  row.get("last_captured_via"),
+            "capture_count":      row.get("capture_count"),
+            "rec_id":             row.get("rec_id"),
+            "sid":                row.get("sid"),
+            "parent_sid":         row.get("parent_sid"),
+            "sid_group_id":       row.get("sid_group_id"),
+            "ldb_freshness":      row.get("ldb_freshness"),
+            "it_skills_raw":      row.get("it_skills") if isinstance(row.get("it_skills"), list) else None,
+        },
+    }
+    payload["profile_completeness"] = derive_completeness(payload)
 
     return {
-        "p_source":          SOURCE,
-        "p_source_row_id":   str(row["id"]),
-        "p_organization_id": None,
-        "p_identifiers":     identifiers,
-        "p_profile":         profile,
-        "p_emails":          emails,
-        "p_phones":          phones,
-        "p_raw_payload":     row,
+        "p_source":        SOURCE,
+        "p_source_row_id": str(row["id"]),
+        "p_payload":       payload,
     }
 
 
@@ -352,6 +487,8 @@ async def run_ingest_loop() -> None:
         # cursor is stored as "ISO|uuid" in cursor_naukri_id? No — keep two:
         # cursor_updated_at holds ts, cursor_naukri_id holds tie-break id.
         while True:
+            run: RunLog | None = None
+            after_ts: str | None = None
             try:
                 ctrl = await read_control(client, "ingest")
                 if not ctrl:
@@ -402,6 +539,25 @@ async def run_ingest_loop() -> None:
 
             except Exception as e:
                 logger.exception(f"[mc-ingest] loop error: {e}")
+                if run is not None:
+                    # Cycle crashed partway through a batch (e.g. read_control/
+                    # advance_cursor/_fetch_batch raised, none of which are
+                    # guarded like _ingest_one is). Without this, the run row
+                    # started above is abandoned at status='running' forever
+                    # with none of its partial counts ever persisted, even
+                    # though the ingest cursor itself already advanced
+                    # correctly via advance_cursor() on each successful inner
+                    # batch. Always finalize so every run reaches a terminal
+                    # status with whatever it actually accomplished.
+                    try:
+                        await run.finish(
+                            "error",
+                            cursor_after=after_ts,
+                            note=(f"crashed: {str(e)[:300]} | "
+                                  f"processed={run.rows_processed} "
+                                  f"ok={run.rows_ingested} err={run.errors_count}"))
+                    except Exception as finish_err:
+                        logger.warning(f"[mc-ingest] failed to finalize crashed run: {finish_err}")
                 await asyncio.sleep(15)
 
             ctrl = await read_control(client, "ingest")
