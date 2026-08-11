@@ -194,6 +194,18 @@ async def delete_id(client: httpx.AsyncClient, doc_id: str) -> None:
         r.raise_for_status()
 
 
+async def get_document(client: httpx.AsyncClient, doc_id: str) -> dict[str, Any] | None:
+    """Fetch a single document by id. None if it doesn't exist."""
+    r = await client.get(
+        f"{TYPESENSE_BASE}/collections/{TS_COLLECTION}/documents/{doc_id}",
+        headers=TS_HEADERS, timeout=HTTP_TIMEOUT_TYPESENSE,
+    )
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
 # ── Synonyms sync (Supabase mc_synonyms → Typesense) ──────────────────────
 async def sync_synonyms(client: httpx.AsyncClient) -> int:
     """Load all synonyms from mc_synonyms table and upsert to Typesense."""

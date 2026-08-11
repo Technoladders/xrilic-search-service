@@ -2,13 +2,32 @@
 sync_service/master_candidates/search_api.py
 
 FastAPI router mounted at /mc.
-POST /mc/search   — takes the InternalFilters payload from useInternalSearch.ts
-                    returns { profiles, total, page, per_page, facets, took_ms,
-                    count_capped }
-GET  /mc/health   — collection stats
+POST /mc/search      — takes the InternalFilters payload from useInternalSearch.ts
+                        returns { profiles, total, page, per_page, facets, took_ms,
+                        count_capped }. UNCHANGED behavior — profile_pic is
+                        still the raw third-party photo URL, kept only for any
+                        caller not yet migrated to /mc/search_v2.
+POST /mc/search_v2   — identical filter/ranking/pagination to /mc/search (both
+                        call _search_impl(); there is no duplicated search
+                        logic to drift). The ONLY difference: profile_pic is a
+                        same-origin proxy URL (/mc/avatar/<id>) instead of the
+                        raw Naukri CDN URL, or null if there's no real photo.
+GET  /mc/avatar/{id} — streams the candidate's photo bytes from our own
+                        origin. Public (no auth — an <img src> can't carry an
+                        Authorization header); the candidate UUID is opaque
+                        and only obtainable by first authenticating through
+                        one of the two search routes above.
+GET  /mc/health      — collection stats
 
-v3 CHANGE (this file only, this turn — everything else identical to the
-previous delivered version):
+v4 CHANGE (this turn): stop leaking the raw Naukri profile-photo URL to the
+browser — it was visible in /mc/search's JSON response body, and rendering it
+in an <img> made the browser fetch Naukri directly, picking up a third-party
+tracking cookie (_t_ds) in the process. /mc/search is left completely
+unchanged (still the raw URL) so nothing that already calls it breaks;
+/mc/search_v2 and /mc/avatar/{id} are additive. See _to_rr_profile(),
+_search_impl(), and the avatar-proxy section near the bottom of this file.
+
+v3 CHANGE (carried from before, unchanged):
 
   TOTAL-COUNT HONESTY + GRACEFUL OVERFLOW, in the nice-skill branch of
   search(). Previously, when more profiles matched than
@@ -45,17 +64,21 @@ import json as _json
 import logging
 import re as _re
 import time as _time
+import uuid
 from typing import Any, Optional
+from urllib.parse import urljoin
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import Response
 
 from .config import (
     TYPESENSE_BASE, TS_HEADERS, TS_COLLECTION,
     SUPABASE_URL, SB_HEADERS,
     HTTP_TIMEOUT_TYPESENSE,
+    PUBLIC_BASE_URL,
 )
-from .typesense_client import QUERY_BY, QUERY_BY_WEIGHTS
+from .typesense_client import QUERY_BY, QUERY_BY_WEIGHTS, get_document
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mc", tags=["master_candidates"])
@@ -253,7 +276,29 @@ def _period(e: dict) -> str:
     return f"{sy} - {ey}" if (sy or ey) else ""
 
 
-def _to_rr_profile(hit: dict[str, Any]) -> dict[str, Any]:
+def _is_real_photo(url: str | None) -> bool:
+    """Naukri serves a generic grey placeholder silhouette
+    (static.naukimg.com/.../defaultAvatar.<hash>.svg) for candidates with no
+    real photo. Treat that as "no photo" — same guard as the frontend's
+    NaukriCandidatesPage.tsx:92 (!photo_url.includes('defaultAvatar'))."""
+    return bool(url) and "defaultAvatar" not in url
+
+
+def _avatar_url(candidate_id: str) -> str:
+    return f"{PUBLIC_BASE_URL}/mc/avatar/{candidate_id}"
+
+
+def _to_rr_profile(hit: dict[str, Any], avatar_proxy: bool) -> dict[str, Any]:
+    """
+    avatar_proxy=False reproduces /mc/search's pre-existing output exactly
+    (profile_pic = the raw third-party URL). avatar_proxy=True is the
+    photo-safe path used by /mc/search_v2. No default value on purpose: every
+    call site must state explicitly which behavior it wants (see _search_impl
+    below, the only caller left after this change — test_bucket_split.py's
+    single-argument call was already broken against this file for unrelated
+    reasons before this change; see the implementation plan for the verified
+    grep proving that).
+    """
     d = hit.get("document", {})
 
     experience = _loads(d.get("experience_json"))
@@ -318,7 +363,9 @@ def _to_rr_profile(hit: dict[str, Any]) -> dict[str, Any]:
         "location":         d.get("location") or "",
         "country_code":     d.get("country") or "",
         "linkedin_url":     d.get("linkedin_url"),
-        "profile_pic":      d.get("profile_picture_url"),
+        "profile_pic": (
+            _avatar_url(d["id"]) if _is_real_photo(d.get("profile_picture_url")) else None
+        ) if avatar_proxy else d.get("profile_picture_url"),
         "connections":      d.get("followers"),
 
         "experience_display":      d.get("experience_display"),
@@ -431,10 +478,15 @@ async def _fetch_rerank_pool(
     return hits, found, facets, took_ms
 
 
-@router.post("/search")
-async def search(request: Request, user_id: str = Depends(require_user)) -> dict[str, Any]:
-    payload = await request.json()
-
+async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str, Any]:
+    """
+    Shared by /mc/search (avatar_proxy=False) and /mc/search_v2
+    (avatar_proxy=True) — this is the exact same filter/ranking/pagination
+    logic as before this file's v4 change, just parameterized on `payload`
+    instead of reading it from a Request directly, so both routes run the
+    identical code path and can never drift apart. avatar_proxy only affects
+    what _to_rr_profile() puts in "profile_pic".
+    """
     # ── ids lookup short-circuit — job-sourcing card hydration ────────────
     ids = [str(i) for i in (payload.get("ids") or []) if i][:100]
     if ids:
@@ -448,7 +500,7 @@ async def search(request: Request, user_id: str = Depends(require_user)) -> dict
         }
         data = await _ts_search(ts_params)
         return {
-            "profiles":     [_to_rr_profile(h) for h in (data.get("hits") or [])],
+            "profiles":     [_to_rr_profile(h, avatar_proxy) for h in (data.get("hits") or [])],
             "total":        data.get("found", 0),
             "page":         1,
             "per_page":     len(ids),
@@ -491,7 +543,7 @@ async def search(request: Request, user_id: str = Depends(require_user)) -> dict
         ts_params = {**base_params, "page": page, "per_page": per_page}
         data = await _ts_search(ts_params)
         return {
-            "profiles":     [_to_rr_profile(h) for h in (data.get("hits") or [])],
+            "profiles":     [_to_rr_profile(h, avatar_proxy) for h in (data.get("hits") or [])],
             "total":        data.get("found", 0),
             "page":         page,
             "per_page":     per_page,
@@ -522,7 +574,7 @@ async def search(request: Request, user_id: str = Depends(require_user)) -> dict
         page_hits = hits_sorted[(page - 1) * per_page: page * per_page]
 
         return {
-            "profiles":     [_to_rr_profile(h) for h in page_hits],
+            "profiles":     [_to_rr_profile(h, avatar_proxy) for h in page_hits],
             # v3 FIX: always the TRUE count — never capped to the pool size.
             "total":        found,
             "page":         page,
@@ -543,7 +595,7 @@ async def search(request: Request, user_id: str = Depends(require_user)) -> dict
     ts_params = {**base_params, "page": page, "per_page": per_page}
     data = await _ts_search(ts_params)
     return {
-        "profiles":     [_to_rr_profile(h) for h in (data.get("hits") or [])],
+        "profiles":     [_to_rr_profile(h, avatar_proxy) for h in (data.get("hits") or [])],
         "total":        data.get("found", 0),
         "page":         page,
         "per_page":     per_page,
@@ -551,6 +603,164 @@ async def search(request: Request, user_id: str = Depends(require_user)) -> dict
         "took_ms":      data.get("search_time_ms"),
         "count_capped": True,
     }
+
+
+@router.post("/search")
+async def search(request: Request, user_id: str = Depends(require_user)) -> dict[str, Any]:
+    payload = await request.json()
+    return await _search_impl(payload, avatar_proxy=False)
+
+
+@router.post("/search_v2")
+async def search_v2(request: Request, user_id: str = Depends(require_user)) -> dict[str, Any]:
+    """
+    Identical filter/ranking/pagination behavior to /mc/search — both call
+    _search_impl, so there is no duplicated search logic to drift out of sync.
+    The ONLY difference is avatar_proxy=True, which changes exactly one field
+    inside _to_rr_profile: profile_pic becomes a same-origin proxy URL
+    (/mc/avatar/<id>) instead of the raw third-party photo URL.
+    """
+    payload = await request.json()
+    return await _search_impl(payload, avatar_proxy=True)
+
+
+# ── Avatar proxy ─────────────────────────────────────────────────────────
+# GET /mc/avatar/{candidate_id} — streams the candidate's photo bytes from
+# our own origin so the browser never sees or requests the raw Naukri CDN
+# URL. Public (no Depends(require_user)): an <img src> request can't carry
+# an Authorization header, and the candidate UUID is opaque — obtaining one
+# requires first authenticating through /mc/search or /mc/search_v2.
+
+_ALLOWED_PHOTO_HOSTS = {"p.naukri.com", "static.naukimg.com"}
+_ALLOWED_PHOTO_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+_MAX_AVATAR_BYTES = 2 * 1024 * 1024          # real Naukri headshots are ~4 KB
+_MAX_PHOTO_REDIRECTS = 3
+_UPSTREAM_HEADERS = {
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+    "accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+}
+
+
+def _is_allowed_photo_host(url: str) -> bool:
+    """HTTPS + exact-hostname allowlist — no substring/`in` checks. Only the
+    two hosts confirmed live for Naukri's photo CDN."""
+    try:
+        parsed = httpx.URL(url)
+    except Exception:
+        return False
+    return parsed.scheme == "https" and parsed.host in _ALLOWED_PHOTO_HOSTS
+
+
+async def _fetch_avatar_bytes(client: httpx.AsyncClient, start_url: str) -> tuple[bytes, str] | None:
+    """
+    Fetches an image from an allowlisted photo host, following redirects
+    MANUALLY so every hop — the starting URL and every subsequent Location
+    header — is independently re-validated against the host allowlist BEFORE
+    it is ever requested.
+
+    Deliberately NOT `follow_redirects=True`: that validates only the first
+    URL and then blindly trusts however many redirects the server issues —
+    an allowlisted host could 302 to an arbitrary internal or external target
+    and the client would follow it unquestioned. This is the SSRF-via-redirect
+    class of bug; the loop below closes it by re-checking the allowlist on
+    every hop, capped at _MAX_PHOTO_REDIRECTS.
+
+    Streams the body and aborts as soon as _MAX_AVATAR_BYTES is exceeded,
+    rather than buffering an unbounded response before checking its size.
+
+    Returns (body_bytes, content_type) on success, None on ANY failure — every
+    failure mode is intentionally collapsed to the same outcome by the caller
+    (an identical 204); only server logs distinguish why.
+    """
+    current = start_url
+    for hop in range(_MAX_PHOTO_REDIRECTS + 1):
+        if not _is_allowed_photo_host(current):
+            logger.warning(f"[mc-avatar] blocked non-allowlisted host at hop {hop}")
+            return None
+
+        try:
+            async with client.stream(
+                "GET", current, headers=_UPSTREAM_HEADERS,
+                follow_redirects=False, timeout=10.0,
+            ) as resp:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("location")
+                    if not location:
+                        return None
+                    current = urljoin(current, location)
+                    continue
+
+                if resp.status_code != 200:
+                    return None
+
+                content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                if content_type not in _ALLOWED_PHOTO_CONTENT_TYPES:
+                    return None
+
+                declared_len = resp.headers.get("content-length")
+                if declared_len and declared_len.isdigit() and int(declared_len) > _MAX_AVATAR_BYTES:
+                    return None
+
+                chunks = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    chunks.extend(chunk)
+                    if len(chunks) > _MAX_AVATAR_BYTES:
+                        return None     # abort mid-stream — never buffer past the cap
+                if not chunks:
+                    return None
+                return bytes(chunks), content_type
+        except httpx.HTTPError as e:
+            logger.warning(f"[mc-avatar] upstream fetch failed: {e}")
+            return None
+
+    logger.warning("[mc-avatar] too many redirects")
+    return None
+
+
+@router.get("/avatar/{candidate_id}")
+async def avatar(candidate_id: str) -> Response:
+    """
+    Public — no auth dependency. See module note above for why.
+
+    Error strategy: a syntactically invalid id is a 400 (a client input
+    error; reveals nothing about any real candidate). EVERY other failure —
+    not found, no photo, disallowed host, upstream error, bad content-type,
+    oversized, too many redirects — is an IDENTICAL 204 with no body, so the
+    response can never be used to distinguish *why* a given id produced no
+    image, or to enumerate which ids correspond to real candidates.
+    """
+    try:
+        uuid.UUID(candidate_id)
+    except ValueError:
+        return Response(status_code=400)
+
+    async with httpx.AsyncClient() as client:
+        doc = await get_document(client, candidate_id)
+        if not doc:
+            return Response(status_code=204)
+
+        photo_url = doc.get("profile_picture_url")
+        if not _is_real_photo(photo_url):
+            return Response(status_code=204)
+
+        fetched = await _fetch_avatar_bytes(client, photo_url)
+
+    if fetched is None:
+        return Response(status_code=204)
+
+    body, content_type = fetched
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers={
+            "Cache-Control": "public, max-age=604800, immutable",
+            "X-Content-Type-Options": "nosniff",
+            # A fresh Response is built from scratch — no upstream header
+            # (including any Set-Cookie, e.g. Naukri's _t_ds tracking cookie)
+            # is ever copied onto it.
+        },
+    )
 
 
 @router.get("/health")

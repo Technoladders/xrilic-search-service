@@ -45,3 +45,9 @@ DEFAULT_CONCURRENCY       = int(os.environ.get("MC_CONCURRENCY", "10"))
 # ── Timeouts ───────────────────────────────────────────────────────────────
 HTTP_TIMEOUT_SUPABASE = 30.0
 HTTP_TIMEOUT_TYPESENSE = 20.0
+
+# ── Public base URL (used to build absolute avatar-proxy links) ────────────
+# No such var existed before; sync.xrilic.ai was only documented as a comment
+# in docker-compose.yml describing what Nginx Proxy Manager routes here — this
+# makes it available to application code, with that exact value as the default.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://sync.xrilic.ai").rstrip("/")

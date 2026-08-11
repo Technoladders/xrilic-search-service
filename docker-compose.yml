@@ -30,6 +30,7 @@ services:
       WEBHOOK_SECRET:        ${WEBHOOK_SECRET}
       ADMIN_SECRET:          ${ADMIN_SECRET}
       POLL_INTERVAL_SEC:     "60"
+      PUBLIC_BASE_URL:       "https://sync.xrilic.ai"   # used to build /mc/avatar/<id> links; matches the Nginx Proxy Manager route below
       
       # Master Candidates
       MC_INGEST_ENABLED:     "false"
