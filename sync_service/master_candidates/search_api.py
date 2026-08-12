@@ -19,39 +19,50 @@ GET  /mc/avatar/{id} — streams the candidate's photo bytes from our own
                         one of the two search routes above.
 GET  /mc/health      — collection stats
 
-v4 CHANGE (this turn): stop leaking the raw Naukri profile-photo URL to the
-browser — it was visible in /mc/search's JSON response body, and rendering it
-in an <img> made the browser fetch Naukri directly, picking up a third-party
-tracking cookie (_t_ds) in the process. /mc/search is left completely
-unchanged (still the raw URL) so nothing that already calls it breaks;
-/mc/search_v2 and /mc/avatar/{id} are additive. See _to_rr_profile(),
-_search_impl(), and the avatar-proxy section near the bottom of this file.
+v5 CHANGE (this turn): moved Boolean query semantics into a testable
+query-planning layer (./search/) and fixed two real bugs found there:
+
+  1. NICE-skill inclusion was ANDed onto MUST/EXCLUDE (`skills:=must &&
+     skills:=[nice-any]`), silently making "nice-to-have" skills a hard
+     mandatory-OR filter — a candidate with zero nice-skill matches was
+     excluded entirely, the opposite of what the sidebar UI implies.
+     Confirmed live: adding a 3rd nice skill (a common one) to a 2-nice
+     search changed total 4,805 -> 118,196; promoting it to `must` instead
+     collapsed it to 1,604. Fixed to the explicit, confirmed product
+     semantics: (ALL must) OR (ANY nice) when both are set — see
+     search/skill_logic.py.
+  2. `keyword` was passed verbatim into Typesense's `q`, relying on the
+     literal words "AND"/"OR"/"NOT" coincidentally overlapping with real
+     query tokens — Typesense's `q` has no native AND/OR/parenthesization
+     (confirmed against Typesense's docs). Replaced with a real parser
+     (search/keyword_query.py) with an explicit EXACT (single Typesense
+     call, exact `found`) vs. BOUNDED (Typesense can't express an OR/union
+     natively, so evaluated over capped pools with an honest, possibly-
+     conservative total and count_capped=True) distinction — never
+     presenting a bounded/approximate count as exact.
+
+Neither change alters `_search_impl`'s response shape
+({profiles, total, page, per_page, facets, took_ms, count_capped}) — that
+contract is frozen because useUnifiedWaterfallSearch.ts's entire internal/
+external waterfall fallback decision is driven by `total` alone. See the
+implementation plan for the full boundary rationale; nothing in this file
+talks to, or is aware of, the external (ContactOut/RocketReach) providers.
+
+v4 CHANGE (carried from before, unchanged): stop leaking the raw Naukri
+profile-photo URL to the browser — it was visible in /mc/search's JSON
+response body, and rendering it in an <img> made the browser fetch Naukri
+directly, picking up a third-party tracking cookie (_t_ds) in the process.
+/mc/search is left completely unchanged (still the raw URL) so nothing that
+already calls it breaks; /mc/search_v2 and /mc/avatar/{id} are additive.
 
 v3 CHANGE (carried from before, unchanged):
 
-  TOTAL-COUNT HONESTY + GRACEFUL OVERFLOW, in the nice-skill branch of
-  search(). Previously, when more profiles matched than
-  RERANK_POOL_HARD_CAP, the response reported "total": RERANK_POOL_HARD_CAP
-  (e.g. 1000) even when the true count was higher (e.g. 2230) — understating
-  how many candidates actually match. Now:
-    • "total" is ALWAYS the true Typesense `found` count, never capped.
-    • Exact nice-skill match-count ranking still only extends
-      RERANK_POOL_HARD_CAP deep (unchanged — that's a real performance
-      tradeoff, not something removed).
-    • Pages beyond that depth are fetched DIRECTLY from Typesense (still
-      respecting the nice-skill OR filter, so every result genuinely
-      matches), ordered by the native sort_by (last_active_date_ts desc,
-      data_freshness_ts desc) instead of exact match-count. No page a user
-      clicks to ever comes back empty because of the pool boundary.
-    • "count_capped" now means "beyond this page, ordering is recency-based
-      rather than exact nice-skill-count" — still real results, just a
-      different (still correct) ordering past that depth.
-
-  v2 CHANGES (carried from before, unchanged):
-    RANKING: nice skills rank by exact match count (computed in Python over
-    a bounded pool, since Typesense can't count OR-filter matches natively).
-    sort_by leads with last_active_date_ts (most recently active first),
-    data_freshness_ts as tiebreaker.
+  TOTAL-COUNT HONESTY + GRACEFUL OVERFLOW, in the nice-skill/keyword-Tier-A
+  branch of search(). "total" is ALWAYS the true Typesense `found` count
+  for that exact query, never capped — only exact match-count/relevance
+  ranking DEPTH is bounded (RERANK_POOL_HARD_CAP), and pages beyond that
+  depth are fetched directly from Typesense (native sort_by), still
+  respecting every filter, just ordered by recency past that depth.
 
   CARRIED FORWARD (also unchanged, same file):
     • ids lookup short-circuit ({"ids": [...]}) — job-sourcing card hydration.
@@ -79,6 +90,9 @@ from .config import (
     PUBLIC_BASE_URL,
 )
 from .typesense_client import QUERY_BY, QUERY_BY_WEIGHTS, get_document
+from .search import keyword_query, skill_logic
+from .search.query_types import KeywordSyntaxError, SearchPlan
+from .search.ranking import fetch_bounded_pool, rank_key
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mc", tags=["master_candidates"])
@@ -89,16 +103,18 @@ router = APIRouter(prefix="/mc", tags=["master_candidates"])
 EXCLUDE_FIELDS = "emails_json,phones_json"
 
 # Typesense's practical max per single request. We page through multiples of
-# this to build the nice-skill rerank pool without ever changing per_page
-# mid-loop (changing per_page between calls breaks Typesense's page-offset
-# math, since offset = (page-1)*per_page using the CURRENT call's per_page).
+# this to build bounded pools (nice-skill rerank AND keyword Tier-B union)
+# without ever changing per_page mid-loop (changing per_page between calls
+# breaks Typesense's page-offset math, since offset = (page-1)*per_page
+# using the CURRENT call's per_page).
 TYPESENSE_MAX_PER_PAGE = 250
 
-# How deep EXACT nice-skill match-count ranking goes. This is a performance
-# bound, NOT a results-count bound — "total" in the response is always the
-# true count regardless of this cap (see the v3 fix above). At the existing
-# per_page cap of 50, this covers 20 pages of exactly-ranked results before
-# falling back to recency ordering for anything deeper.
+# How deep EXACT nice-skill match-count ranking / keyword Tier-B union goes.
+# This is a performance bound, NOT a results-count bound for Tier A / plain
+# nice-skill queries — "total" there is always the true Typesense `found`
+# count regardless of this cap. For Tier-B keyword OR/union, this IS a
+# real bound on the reported total (see search/keyword_query.py) — that's
+# the honest, deliberate tradeoff documented in the implementation plan.
 RERANK_POOL_HARD_CAP = 1000
 
 
@@ -113,37 +129,12 @@ def _filter_any(field: str, values: list[str]) -> str | None:
     return f"{field}:=[" + ",".join(_escape(v) for v in values) + "]"
 
 
-def _filter_all_skills(values: list[str]) -> str | None:
-    if not values:
-        return None
-    # ALL: chain with AND — Typesense supports array-contains semantics on
-    # string[] fields via `:=` per-value
-    return " && ".join([f"skills:={_escape(v)}" for v in values])
-
-
-def _filter_none_skills(values: list[str]) -> str | None:
-    if not values:
-        return None
-    return " && ".join([f"skills:!={_escape(v)}" for v in values])
-
-
-def _extract_skill_chips(f: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
-    """(must, nice, exclude) labels from filters.skillChips."""
-    chips = f.get("skillChips") or []
-    must    = [c["label"] for c in chips if c.get("mode") == "must" and c.get("label")]
-    nice    = [c["label"] for c in chips if c.get("mode") == "nice" and c.get("label")]
-    exclude = [c["label"] for c in chips if c.get("mode") == "exclude" and c.get("label")]
-    return must, nice, exclude
-
-
 def _parse_years_bucket(v: Any) -> tuple[Optional[int], Optional[int]]:
     """
     'yearsExperience' arrives as the bucket string the sidebar sends
     (e.g. "0_1", "3_5", "10"), matching YEARS_OPTIONS in
-    SourceXRSearchSidebar.tsx. Previously this function looked for
-    "yearsMin"/"yearsMax" keys that are never sent by the frontend at all,
-    so the filter silently did nothing on /mc/search. Returns
-    (min_years, max_years); "10" (10+ years) has no upper bound.
+    SourceXRSearchSidebar.tsx. Returns (min_years, max_years); "10" (10+
+    years) has no upper bound.
     """
     if not v or not isinstance(v, str):
         return None, None
@@ -170,11 +161,11 @@ ACTIVITY_DAY_RANGES: dict[str, tuple[int, Optional[int]]] = {
 def _activity_filter(category: Any) -> Optional[str]:
     """
     Real backend predicate for the Activity filter. Filters on
-    last_active_date_ts (int64, already live in the Typesense collection —
-    confirmed, not assumed). Bounds are inclusive day counts converted to a
-    unix-seconds window measured back from "now"; a smaller day count means
-    more recent, i.e. a larger timestamp, hence the swapped comparison
-    directions vs. the day range itself.
+    last_active_date_ts (int64, already live in the Typesense collection).
+    Bounds are inclusive day counts converted to a unix-seconds window
+    measured back from "now"; a smaller day count means more recent, i.e.
+    a larger timestamp, hence the swapped comparison directions vs. the
+    day range itself.
     """
     if not category or category not in ACTIVITY_DAY_RANGES:
         return None
@@ -188,17 +179,14 @@ def _activity_filter(category: Any) -> Optional[str]:
     return " && ".join(parts)
 
 
-def _build_filter_by(f: dict[str, Any]) -> str:
+def _build_other_hard_filters(f: dict[str, Any]) -> str:
+    """
+    Everything EXCEPT skills (must/nice/exclude, owned by skill_logic.py)
+    and keyword (owned by keyword_query.py): titles, employer, location,
+    education, experience, activity, contact, full-profile.
+    """
     parts: list[str] = []
 
-    # skills: must-all, nice = at-least-one (inclusion only — ranking by
-    # match count happens in search(), Typesense filters can't count).
-    must, nice, exclude = _extract_skill_chips(f)
-    for p in [_filter_all_skills(must), _filter_any("skills", nice), _filter_none_skills(exclude)]:
-        if p:
-            parts.append(p)
-
-    # titles (current only vs also past)
     titles = f.get("titles") or []
     include_past = bool(f.get("includePastTitles"))
     if titles:
@@ -210,7 +198,6 @@ def _build_filter_by(f: dict[str, Any]) -> str:
         else:
             parts.append(f"title:=[{','.join(_escape(t) for t in titles)}]")
 
-    # employer
     employers = f.get("currentEmployer") or []
     any_emp   = bool(f.get("anyEmployer"))
     if employers:
@@ -222,31 +209,20 @@ def _build_filter_by(f: dict[str, Any]) -> str:
         else:
             parts.append(f"current_employer:=[{','.join(_escape(e) for e in employers)}]")
 
-    # locations (OR)
     if p := _filter_any("location", f.get("locations") or []):
         parts.append(p)
 
-    # education
     if p := _filter_any("schools", f.get("school") or []):
         parts.append(p)
     if p := _filter_any("degrees", f.get("degree") or []):
         parts.append(p)
 
-    # years of experience — FIX: previously read "yearsMin"/"yearsMax",
-    # keys the frontend never sends (it sends "yearsExperience" as a
-    # bucket string like "3_5" or "10"). That mismatch meant this filter
-    # silently did nothing on /mc/search.
     y_min, y_max = _parse_years_bucket(f.get("yearsExperience"))
     if y_min is not None:
         parts.append(f"total_experience_months:>={y_min*12}")
     if y_max is not None:
         parts.append(f"total_experience_months:<={y_max*12}")
 
-    # activity — FIX: was frontend-only (client-side post-filter on the
-    # current page only, per SourceXRSearchSidebar.tsx's prior header
-    # comment). Now a real predicate on last_active_date_ts so it actually
-    # narrows what the server returns and the total count, not just what's
-    # shown on the current page.
     if p := _activity_filter(f.get("activityCategory")):
         parts.append(p)
 
@@ -256,6 +232,37 @@ def _build_filter_by(f: dict[str, Any]) -> str:
         parts.append("has_full_profile:=true")
 
     return " && ".join(parts) if parts else ""
+
+
+def _build_search_plan(filters: dict[str, Any]) -> SearchPlan:
+    """Raises KeywordSyntaxError for a malformed `keyword` Boolean expression."""
+    skills = skill_logic.extract_skill_chips(filters)
+    keyword_ast = keyword_query.parse(filters.get("keyword") or "")
+    return SearchPlan(
+        keyword_ast=keyword_ast,
+        skills=skills,
+        inclusion_filter_by=skill_logic.build_inclusion_filter(skills) or "",
+        exclude_filter_by=skill_logic.build_exclude_filter(skills) or "",
+        other_hard_filter_by=_build_other_hard_filters(filters),
+    )
+
+
+def _combined_filter_by(plan: SearchPlan) -> str:
+    """
+    ANDs inclusion/exclude/other-hard-filters together. inclusion_filter_by
+    may itself contain a top-level `||` (when both MUST and NICE are set —
+    see skill_logic.build_inclusion_filter) — since `&&` binds tighter than
+    `||`, joining it unparenthesized with the other AND-ed clauses would
+    silently scope EXCLUDE onto only the last OR-branch instead of the
+    whole inclusion result (e.g. "A || B && C" parses as "A || (B && C)",
+    not "(A || B) && C"). Wrapping it here keeps EXCLUDE applied to the
+    outside of whichever inclusion branch a candidate matched through,
+    regardless of how skill_logic composed the inner clause.
+    """
+    inclusion = f"({plan.inclusion_filter_by})" if plan.inclusion_filter_by else ""
+    return " && ".join(
+        p for p in [inclusion, plan.exclude_filter_by, plan.other_hard_filter_by] if p
+    )
 
 
 def _loads(s: Any) -> list:
@@ -293,11 +300,7 @@ def _to_rr_profile(hit: dict[str, Any], avatar_proxy: bool) -> dict[str, Any]:
     avatar_proxy=False reproduces /mc/search's pre-existing output exactly
     (profile_pic = the raw third-party URL). avatar_proxy=True is the
     photo-safe path used by /mc/search_v2. No default value on purpose: every
-    call site must state explicitly which behavior it wants (see _search_impl
-    below, the only caller left after this change — test_bucket_split.py's
-    single-argument call was already broken against this file for unrelated
-    reasons before this change; see the implementation plan for the verified
-    grep proving that).
+    call site must state explicitly which behavior it wants.
     """
     d = hit.get("document", {})
 
@@ -445,48 +448,38 @@ async def _ts_search(ts_params: dict[str, Any]) -> dict[str, Any]:
     return r.json()
 
 
-async def _fetch_rerank_pool(
-    base_params: dict[str, Any], needed: int,
-) -> tuple[list[dict], int, list, Optional[float]]:
-    """
-    Fetches Typesense pages (fixed per_page=TYPESENSE_MAX_PER_PAGE — must
-    stay constant across calls, since Typesense's offset math is
-    (page-1)*per_page using the CURRENT call's per_page) until `needed` hits
-    are collected, the pool exhausts, or RERANK_POOL_HARD_CAP is reached.
-    Returns (hits, total_found, facet_counts, took_ms).
-    """
-    hits: list[dict] = []
-    found = 0
-    facets: list = []
-    took_ms: Optional[float] = None
-    target = min(max(needed, 1), RERANK_POOL_HARD_CAP)
-
-    pool_page = 1
-    while len(hits) < target:
-        params = {**base_params, "page": pool_page, "per_page": TYPESENSE_MAX_PER_PAGE}
-        data = await _ts_search(params)
-        page_hits = data.get("hits") or []
-        if pool_page == 1:
-            found = data.get("found", 0)
-            facets = data.get("facet_counts", [])
-            took_ms = data.get("search_time_ms")
-        hits.extend(page_hits)
-        if len(page_hits) < TYPESENSE_MAX_PER_PAGE:
-            break  # exhausted every actual match — nothing more to fetch
-        pool_page += 1
-
-    return hits, found, facets, took_ms
+def _log_search(plan: SearchPlan, filter_by: str, q: str, tier: str,
+                 found: int, took_ms: Optional[float], capped: bool,
+                 total_ms: float) -> None:
+    """Structured, non-PII debug log. Never logs candidate names/contacts/resumes."""
+    logger.info(
+        "mc_search "
+        f"must_count={len(plan.skills.must)} nice_count={len(plan.skills.nice)} "
+        f"exclude_count={len(plan.skills.exclude)} keyword_tier={tier} "
+        f"q={q!r} filter_by={filter_by!r} typesense_found={found} "
+        f"typesense_search_ms={took_ms} count_capped={capped} "
+        f"backend_total_ms={total_ms:.1f}"
+    )
 
 
 async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str, Any]:
     """
     Shared by /mc/search (avatar_proxy=False) and /mc/search_v2
-    (avatar_proxy=True) — this is the exact same filter/ranking/pagination
-    logic as before this file's v4 change, just parameterized on `payload`
-    instead of reading it from a Request directly, so both routes run the
-    identical code path and can never drift apart. avatar_proxy only affects
-    what _to_rr_profile() puts in "profile_pic".
+    (avatar_proxy=True) — identical filter/ranking/pagination logic, just
+    parameterized on `payload` instead of reading it from a Request
+    directly, so both routes run the same code path and can never drift
+    apart. avatar_proxy only affects what _to_rr_profile() puts in
+    "profile_pic".
+
+    Response shape is a FROZEN CONTRACT — every branch below returns
+    exactly {profiles, total, page, per_page, facets, took_ms,
+    count_capped}. useUnifiedWaterfallSearch.ts's entire internal/external
+    waterfall fallback decision is driven by `total` alone; nothing here
+    may change that shape or add new top-level fields the frontend doesn't
+    already read.
     """
+    start_time = _time.monotonic()
+
     # ── ids lookup short-circuit — job-sourcing card hydration ────────────
     ids = [str(i) for i in (payload.get("ids") or []) if i][:100]
     if ids:
@@ -513,13 +506,15 @@ async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str,
     page = max(1, int(payload.get("page", 1)))
     per_page = min(50, max(1, int(payload.get("per_page", 25))))
 
-    q = (filters.get("keyword") or "").strip() or "*"
-    _, nice, _ = _extract_skill_chips(filters)
+    try:
+        plan = _build_search_plan(filters)
+    except KeywordSyntaxError as e:
+        raise HTTPException(status_code=400, detail=f"invalid keyword expression: {e}")
 
-    filter_by = _build_filter_by(filters)
+    filter_by = _combined_filter_by(plan)
+    tier, exact_q = keyword_query.plan_keyword(plan.keyword_ast)
 
     base_params: dict[str, Any] = {
-        "q":                q,
         "query_by":         QUERY_BY,
         "query_by_weights": QUERY_BY_WEIGHTS,
         "num_typos":        "2,1,0,0,0,0,0,0,0,0,0,0",
@@ -528,23 +523,31 @@ async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str,
         "max_facet_values": "10",
         "highlight_fields": "full_name,title,skills_text",
         "exclude_fields":   EXCLUDE_FIELDS,
-        "sort_by": (
-            "_text_match:desc,last_active_date_ts:desc,data_freshness_ts:desc"
-            if q != "*" else
-            "last_active_date_ts:desc,data_freshness_ts:desc"
-        ),
     }
-    if filter_by:
-        base_params["filter_by"] = filter_by
 
-    if not nice:
-        # ── Simple path: no nice skills → Typesense's native sort_by is
-        # already exactly correct. One call, same cost as before.
-        ts_params = {**base_params, "page": page, "per_page": per_page}
+    needs_pool = bool(plan.skills.nice) or tier == "B"
+
+    if not needs_pool:
+        # ── Simple path: single native Typesense call. Same cost as before
+        # this change for the common case (no nice skills, no OR/parens in
+        # keyword). ──────────────────────────────────────────────────────
+        q = exact_q if tier == "A" else "*"
+        ts_params = {
+            **base_params, "q": q, "page": page, "per_page": per_page,
+            "sort_by": ("_text_match:desc,last_active_date_ts:desc,data_freshness_ts:desc"
+                        if q != "*" else "last_active_date_ts:desc,data_freshness_ts:desc"),
+        }
+        if tier == "A":
+            ts_params["drop_tokens_threshold"] = 0
+        if filter_by:
+            ts_params["filter_by"] = filter_by
         data = await _ts_search(ts_params)
+        found = data.get("found", 0)
+        _log_search(plan, filter_by, q, tier, found, data.get("search_time_ms"),
+                    False, (_time.monotonic() - start_time) * 1000)
         return {
             "profiles":     [_to_rr_profile(h, avatar_proxy) for h in (data.get("hits") or [])],
-            "total":        data.get("found", 0),
+            "total":        found,
             "page":         page,
             "per_page":     per_page,
             "facets":       data.get("facet_counts", []),
@@ -552,56 +555,71 @@ async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str,
             "count_capped": False,
         }
 
-    # ── Nice-skill path ────────────────────────────────────────────────────
-    needed = page * per_page
+    if tier == "B":
+        # ── Keyword Tier-B: bounded OR/union evaluation, strictly internal
+        # to this function — never touches the response shape below. ────
+        bound_result = await keyword_query.evaluate_bounded(
+            plan.keyword_ast,
+            ts_search=_ts_search,
+            base_params=base_params,
+            structured_filter_by=filter_by,
+            pool_cap=RERANK_POOL_HARD_CAP,
+            page_size=TYPESENSE_MAX_PER_PAGE,
+        )
+        hits, found, capped = bound_result.hits, bound_result.total, bound_result.capped
+        took_ms = None
+    else:
+        # tier in ("empty", "A"), but nice skills need ranking — reuse the
+        # bounded-pool pattern (same as before this change, just extracted).
+        q = exact_q if tier == "A" else "*"
+        pool_params = {**base_params, "q": q}
+        if tier == "A":
+            pool_params["drop_tokens_threshold"] = 0
+        if filter_by:
+            pool_params["filter_by"] = filter_by
 
-    if needed <= RERANK_POOL_HARD_CAP:
-        # Fully exact-ranked: fetch the pool, count-rank in Python, slice.
-        hits, found, facets, took_ms = await _fetch_rerank_pool(base_params, needed)
+        needed = page * per_page
+        if needed <= RERANK_POOL_HARD_CAP:
+            hits, found, facets, took_ms = await fetch_bounded_pool(
+                _ts_search, pool_params, needed, RERANK_POOL_HARD_CAP, TYPESENSE_MAX_PER_PAGE,
+            )
+            capped = found > RERANK_POOL_HARD_CAP
+        else:
+            # Requested page is beyond the exact-rank pool depth — fetch
+            # THIS SPECIFIC page directly from Typesense (still respects
+            # every filter; just ordered by recency past this depth).
+            direct_params = {
+                **pool_params, "page": page, "per_page": per_page,
+                "sort_by": "last_active_date_ts:desc,data_freshness_ts:desc",
+            }
+            data = await _ts_search(direct_params)
+            found = data.get("found", 0)
+            _log_search(plan, filter_by, q, tier, found, data.get("search_time_ms"),
+                        True, (_time.monotonic() - start_time) * 1000)
+            return {
+                "profiles":     [_to_rr_profile(h, avatar_proxy) for h in (data.get("hits") or [])],
+                "total":        found,
+                "page":         page,
+                "per_page":     per_page,
+                "facets":       data.get("facet_counts", []),
+                "took_ms":      data.get("search_time_ms"),
+                "count_capped": True,
+            }
 
-        nice_lower = {s.lower() for s in nice}
+    hits_sorted = sorted(hits, key=lambda h: rank_key(h, plan.skills.nice))
+    page_hits = hits_sorted[(page - 1) * per_page: page * per_page]
 
-        def _rank_key(hit: dict[str, Any]) -> tuple:
-            doc = hit.get("document", {})
-            skills_lower = {str(s).lower() for s in (doc.get("skills") or [])}
-            match_count = len(skills_lower & nice_lower)
-            text_match = hit.get("text_match") or 0
-            last_active = doc.get("last_active_date_ts") or 0
-            freshness = doc.get("data_freshness_ts") or 0
-            return (-match_count, -text_match, -last_active, -freshness)
-
-        hits_sorted = sorted(hits, key=_rank_key)
-        page_hits = hits_sorted[(page - 1) * per_page: page * per_page]
-
-        return {
-            "profiles":     [_to_rr_profile(h, avatar_proxy) for h in page_hits],
-            # v3 FIX: always the TRUE count — never capped to the pool size.
-            "total":        found,
-            "page":         page,
-            "per_page":     per_page,
-            "facets":       facets,
-            "took_ms":      took_ms,
-            # true only if the true count exceeds what we exact-rank; pages
-            # beyond this depth (below) still return real, filter-matching
-            # results — just ordered by recency, not exact nice-skill count.
-            "count_capped": found > RERANK_POOL_HARD_CAP,
-        }
-
-    # ── v3 FIX: page requested is beyond the exact-rank pool. Fetch THIS
-    # SPECIFIC page directly from Typesense — still respects the nice-skill
-    # OR filter (every result genuinely matches), just ordered by the native
-    # sort_by (recency) instead of exact match-count this deep. This is what
-    # keeps deep pagination from ever returning an empty/broken page.
-    ts_params = {**base_params, "page": page, "per_page": per_page}
-    data = await _ts_search(ts_params)
+    log_q = exact_q if tier == "A" else (filters.get("keyword") or "*") if tier == "B" else "*"
+    _log_search(plan, filter_by, log_q, tier, found, took_ms, capped,
+                (_time.monotonic() - start_time) * 1000)
     return {
-        "profiles":     [_to_rr_profile(h, avatar_proxy) for h in (data.get("hits") or [])],
-        "total":        data.get("found", 0),
+        "profiles":     [_to_rr_profile(h, avatar_proxy) for h in page_hits],
+        "total":        found,
         "page":         page,
         "per_page":     per_page,
-        "facets":       data.get("facet_counts", []),
-        "took_ms":      data.get("search_time_ms"),
-        "count_capped": True,
+        "facets":       [],
+        "took_ms":      took_ms,
+        "count_capped": capped,
     }
 
 
