@@ -121,14 +121,52 @@ async def fetch_page(client: httpx.AsyncClient, after_ts: Optional[str],
 
 
 def _start_task() -> None:
+    # TEMPORARY DIAGNOSTIC LOGGING -- to be removed once the worker
+    # lifecycle issue is root-caused. Traces every step of task creation
+    # and reports the task's final outcome (normal return / cancelled /
+    # exception) via add_done_callback, since an exception on a task
+    # nobody ever awaits is otherwise only reported by asyncio's own
+    # generic "Task exception was never retrieved" handler, which does
+    # NOT contain "mc-backfill" and is easy to miss when grepping for it.
     global _current_task
-    _current_task = asyncio.create_task(run_backfill_loop())
+    logger.warning("[mc-backfill] _start_task: entered, about to call asyncio.create_task(run_backfill_loop())")
+    task = asyncio.create_task(run_backfill_loop())
+    logger.warning(
+        f"[mc-backfill] _start_task: asyncio.create_task returned, "
+        f"task_id={id(task)} done={task.done()} cancelled={task.cancelled()}"
+    )
+
+    def _on_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            logger.warning(f"[mc-backfill] run_backfill_loop task_id={id(t)} was CANCELLED")
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.error(
+                f"[mc-backfill] run_backfill_loop task_id={id(t)} finished WITH EXCEPTION: "
+                f"{type(exc).__name__}: {exc}",
+                exc_info=exc,
+            )
+        else:
+            logger.warning(f"[mc-backfill] run_backfill_loop task_id={id(t)} finished normally (function returned)")
+
+    task.add_done_callback(_on_done)
+    _current_task = task
+    logger.warning(
+        f"[mc-backfill] _start_task: _current_task assigned, "
+        f"task_id={id(_current_task)} done={_current_task.done()} cancelled={_current_task.cancelled()}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # The real, stateful job
 # ─────────────────────────────────────────────────────────────────────────────
 async def run_backfill_loop() -> None:
+    # TEMPORARY DIAGNOSTIC: unmistakable entry marker, logged before
+    # anything else in this function (including the `global` binding),
+    # so we can conclusively tell whether this coroutine ever starts
+    # executing at all once asyncio.create_task() has scheduled it.
+    logger.warning(f"[mc-backfill] run_backfill_loop: ENTERED (instance={_INSTANCE_ID})")
     global _run_state
     _run_state = RunState()
     _stop_event.clear()
@@ -248,14 +286,20 @@ async def claim_watchdog() -> None:
                     ctrl = await state.read_control(client)
                     if ctrl and ctrl.should_run:
                         claimed = await state.try_claim(client, _INSTANCE_ID)
+                        # TEMPORARY DIAGNOSTIC: this line was previously
+                        # missing entirely -- a string of failed claims
+                        # produced zero log output, indistinguishable from
+                        # the watchdog not ticking at all.
+                        logger.warning(f"[mc-backfill] claim_watchdog tick: try_claim returned {claimed}")
                         if claimed:
+                            logger.warning("[mc-backfill] claim_watchdog: claim succeeded, calling _start_task()")
                             _start_task()
-                            logger.warning(f"[mc-backfill] claimed job (instance={_INSTANCE_ID})")
+                            logger.warning(f"[mc-backfill] claim_watchdog: _start_task() call returned (instance={_INSTANCE_ID})")
                         # else: someone else's heartbeat is still fresh this
                         # tick -- do nothing and retry next tick, this is a
                         # loop, not a one-time attempt.
             except Exception as e:
-                logger.warning(f"[mc-backfill] claim watchdog tick failed: {e}")
+                logger.exception(f"[mc-backfill] claim watchdog tick failed: {e}")
             await asyncio.sleep(CLAIM_WATCHDOG_INTERVAL_SEC)
 
 
@@ -285,8 +329,12 @@ async def start(client: httpx.AsyncClient, batch_size: Optional[int] = None,
     await state.mark_running(client, batch_size=batch_size, concurrency=concurrency,
                               fresh_session=not resuming)
     claimed = await state.try_claim(client, _INSTANCE_ID)
+    # TEMPORARY DIAGNOSTIC LOGGING
+    logger.warning(f"[mc-backfill] worker.start(): try_claim returned {claimed}")
     if claimed:
+        logger.warning("[mc-backfill] worker.start(): claim succeeded, calling _start_task()")
         _start_task()
+        logger.warning("[mc-backfill] worker.start(): _start_task() call returned")
     # If not claimed, some other instance's heartbeat is fresh -- that
     # instance's own worker (or its watchdog) is already running the job;
     # nothing more to do here.
