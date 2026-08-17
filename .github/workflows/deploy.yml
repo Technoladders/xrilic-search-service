@@ -86,8 +86,8 @@ jobs:
             echo "MC_COLLECTION_NAME=master_candidates_v1" >> .env
 
             # Master Candidates -- portal_a backfill (separate module)
-            echo "MC_BACKFILL_BATCH_SIZE=1000" >> .env
-            echo "MC_BACKFILL_CONCURRENCY=30" >> .env
+            echo "MC_BACKFILL_BATCH_SIZE=500" >> .env
+            echo "MC_BACKFILL_CONCURRENCY=20" >> .env
             echo "MC_BACKFILL_AUTO_RESUME=true" >> .env
 
             echo "→ Restarting containers..."
