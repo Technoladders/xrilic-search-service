@@ -1,0 +1,367 @@
+[
+  {
+    "a": "Rahul Kumar",
+    "b": "Rahul Kumar",
+    "expected_similarity": 1
+  },
+  {
+    "a": "Rahul Kumar",
+    "b": "Rahul Kumar Sharma",
+    "expected_similarity": 0.631579
+  },
+  {
+    "a": "Priya Sharma",
+    "b": "Priya Sarma",
+    "expected_similarity": 0.666667
+  },
+  {
+    "a": "Amit Patel",
+    "b": "Amit Patil",
+    "expected_similarity": 0.571429
+  },
+  {
+    "a": "S. Venkatesh",
+    "b": "Srinivas Venkatesh",
+    "expected_similarity": 0.55
+  },
+  {
+    "a": "Kumar",
+    "b": "Kumari",
+    "expected_similarity": 0.625
+  },
+  {
+    "a": "Mohammed Ali",
+    "b": "Md Ali",
+    "expected_similarity": 0.333333
+  },
+  {
+    "a": "Jane Doe",
+    "b": "John Smith",
+    "expected_similarity": 0.0526316
+  },
+  {
+    "a": "",
+    "b": "Rahul Kumar",
+    "expected_similarity": 0
+  },
+  {
+    "a": "A.K. Singh",
+    "b": "Ajay Kumar Singh",
+    "expected_similarity": 0.421053
+  },
+  {
+    "a": "Sai Kiran",
+    "b": "Sai Kiran Reddy",
+    "expected_similarity": 0.625
+  },
+  {
+    "a": "...",
+    "b": "Rahul Kumar",
+    "expected_similarity": 0
+  },
+  {
+    "a": "O'Brien",
+    "b": "OBrien",
+    "expected_similarity": 0.5
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ". ......",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "..",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "..",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "..",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "..",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "..",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "..",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "..",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "...",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "...",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "....",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "....",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "....",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "....",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".....",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".....",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "......",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "......",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": ".......",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "........",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "........",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "..............",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "&#039;Mohd Anees Shaikh&#039;",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "a",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "a",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  },
+  {
+    "a": ".",
+    "b": "A",
+    "expected_similarity": 0
+  }
+]

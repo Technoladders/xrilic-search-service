@@ -60,7 +60,15 @@ def chip(label, mode):
     return {"label": label, "mode": mode}
 
 
-print("=== 1. Skill MUST/NICE OR-fix (re-run of the 3 scenarios from investigation) ===")
+print("=== 0. Single-nice-skill degenerate-pool fix (live-verification finding) ===")
+r0 = search(skill_chips=[chip("react", "nice")])
+print(f"  nice=[react] alone -> total={r0['total']}, count_capped={r0['count_capped']}")
+print("  AFTER the fix this must be count_capped=False (no MUST set, single nice skill")
+print("  makes ranking degenerate — the fast single-call path applies, same as MUST-only).")
+if r0["count_capped"]:
+    print("  !! FIX DID NOT DEPLOY CORRECTLY — this was the exact bug reported in production.")
+
+print("\n=== 1. Skill MUST/NICE OR-fix (re-run of the 3 scenarios from investigation) ===")
 r1 = search(skill_chips=[chip("b2b", "nice"), chip("business developement", "nice")])
 print(f"  nice=[b2b,business developement] -> total={r1['total']} (expect same universe as before: pure OR of the two)")
 

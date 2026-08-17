@@ -372,7 +372,10 @@ def _to_rr_profile(hit: dict[str, Any], avatar_proxy: bool) -> dict[str, Any]:
         "connections":      d.get("followers"),
 
         "experience_display":      d.get("experience_display"),
+        "current_ctc_lacs":        d.get("current_ctc_lacs"),
+        "expected_ctc_lacs":       d.get("expected_ctc_lacs"),
         "current_ctc_display":     d.get("current_ctc_display"),
+        "notice_period_days":      d.get("notice_period_days"),
         "notice_period_display":   d.get("notice_period_display"),
         "preferred_locations":     d.get("preferred_locations") or [],
         "last_active_date":        d.get("last_active_date"),
@@ -405,7 +408,10 @@ def _to_rr_profile(hit: dict[str, Any], avatar_proxy: bool) -> dict[str, Any]:
             "masterId":           d["id"],
             "experienceDisplay":  d.get("experience_display"),
             "totalExpMonths":     d.get("total_experience_months"),
+            "currentCtcLacs":     d.get("current_ctc_lacs"),
+            "expectedCtcLacs":    d.get("expected_ctc_lacs"),
             "ctcDisplay":         d.get("current_ctc_display"),
+            "noticePeriodDays":   d.get("notice_period_days"),
             "noticeDisplay":      d.get("notice_period_display"),
             "hasFullProfile":     bool(d.get("has_full_profile")),
             "preferredLocations": d.get("preferred_locations") or [],
@@ -525,7 +531,20 @@ async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str,
         "exclude_fields":   EXCLUDE_FIELDS,
     }
 
-    needs_pool = bool(plan.skills.nice) or tier == "B"
+    # Nice-match-count ranking only differentiates candidates when it can
+    # take more than one value among the candidates that pass the inclusion
+    # filter. With a single nice skill and no MUST, the inclusion filter
+    # (skills:=[x]) already forces every match to have exactly that skill —
+    # ranking by "does it have x" is degenerate (always 1) and pooling for
+    # it buys nothing but an extra round-trip and a misleading
+    # count_capped=True on a query whose total was always exact. Confirmed
+    # live: nice=[react] alone returned count_capped=true with no actual
+    # ranking ambiguity. With MUST also set, or 2+ nice skills, match-count
+    # is a real 0..N range and the pool remains worth it.
+    nice_ranking_is_meaningful = bool(plan.skills.nice) and (
+        len(plan.skills.nice) > 1 or bool(plan.skills.must)
+    )
+    needs_pool = nice_ranking_is_meaningful or tier == "B"
 
     if not needs_pool:
         # ── Simple path: single native Typesense call. Same cost as before

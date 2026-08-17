@@ -38,6 +38,8 @@ from master_candidates import (
     admin_api as mc_admin,
     ingest as mc_ingest,
 )
+from master_candidates.backfill import api as mc_backfill_api
+from master_candidates.backfill import worker as mc_backfill_worker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -122,6 +124,16 @@ async def lifespan(app: FastAPI):
         )
 
     # ------------------------------------------------------------------
+    # NEW: Master Candidates backfill (portal_a) -- separate, purpose-built
+    # module; does not touch mc_ingest/mc_index/state.py's mc_process_*
+    # tables at all. claim_watchdog() is a persistent loop (not a one-shot
+    # boot check) so it keeps retrying the single-claimant claim rather
+    # than giving up if another instance's heartbeat is still fresh.
+    # ------------------------------------------------------------------
+    mc_backfill_worker.start_watchdog()
+    logger.info("[mc-backfill] claim watchdog started")
+
+    # ------------------------------------------------------------------
 
     yield
 
@@ -136,9 +148,11 @@ async def lifespan(app: FastAPI):
 
     if mc_index_task:
         mc_index_task.cancel()
-        
+
     if mc_ingest_task:
         mc_ingest_task.cancel()
+
+    mc_backfill_worker.cancel_all()
 
     logger.info("xrilic-search-service stopped.")
 
@@ -153,6 +167,7 @@ app.add_middleware(
 )
 app.include_router(mc_search.router)
 app.include_router(mc_admin.router)
+app.include_router(mc_backfill_api.router)
 
 
 @app.get("/health")

@@ -39,6 +39,14 @@ services:
       MC_BATCH_SIZE:         "500"
       MC_COLLECTION_NAME:    "master_candidates_v1"
 
+      # Master Candidates -- portal_a backfill (separate module, see
+      # sync_service/master_candidates/backfill/). Auto-resume defaults on:
+      # a running backfill must survive a container restart and keep going
+      # until it finishes or a superadmin explicitly pauses/stops it.
+      MC_BACKFILL_BATCH_SIZE:  "500"
+      MC_BACKFILL_CONCURRENCY: "20"
+      MC_BACKFILL_AUTO_RESUME: "true"
+
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s

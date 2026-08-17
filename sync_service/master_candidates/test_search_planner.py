@@ -503,6 +503,60 @@ async def test_fallback_response_shape_is_frozen(patch_ts_search):
     assert set(result.keys()) == {"profiles", "total", "page", "per_page", "facets", "took_ms", "count_capped"}
 
 
+async def test_single_nice_skill_no_must_skips_pool(patch_ts_search):
+    """Live-verification finding: nice=[x] alone is a degenerate ranking case
+    (every match has match_count=1 by construction of skills:=[x]) — it must
+    take the single-call fast path, not the bounded/rerank pool, and must
+    report count_capped=False with Typesense's own exact `found`."""
+    db = [_mk(f"c{i}", skills=["react"], last_active_ts=100 - i) for i in range(5)]
+    patch_ts_search(db)
+    call_count = 0
+    real_fake = search_api._ts_search
+
+    async def counting_fake(params):
+        nonlocal call_count
+        call_count += 1
+        return await real_fake(params)
+
+    import unittest.mock as mock
+    with mock.patch.object(search_api, "_ts_search", counting_fake):
+        result = await search_api._search_impl(
+            {"filters": chips(nice=["react"]), "page": 1, "per_page": 10}, avatar_proxy=True,
+        )
+    assert call_count == 1, f"expected exactly one Typesense call, got {call_count}"
+    assert result["count_capped"] is False
+    assert result["total"] == 5
+    assert len(result["profiles"]) == 5
+
+
+async def test_single_nice_skill_with_must_still_pools(patch_ts_search):
+    """Not degenerate: a MUST-branch-qualifying candidate may or may not also
+    have the one nice skill, so ranking is meaningful and the pool stays."""
+    db = [
+        _mk("must-plus-nice", skills=["sales", "b2b", "saas"], last_active_ts=100),
+        _mk("must-only", skills=["sales", "b2b"], last_active_ts=90),
+    ]
+    patch_ts_search(db)
+    result = await search_api._search_impl(
+        {"filters": chips(must=["sales", "b2b"], nice=["saas"]), "page": 1, "per_page": 10},
+        avatar_proxy=True,
+    )
+    order = [p["id"] for p in result["profiles"]]
+    assert order == ["must-plus-nice", "must-only"]
+
+
+async def test_multi_nice_skill_still_pools_and_can_be_capped(patch_ts_search, monkeypatch):
+    """2+ nice skills is a real ranking range (0..N) — pooling/capping still applies."""
+    monkeypatch.setattr(search_api, "RERANK_POOL_HARD_CAP", 2)
+    db = [_mk(f"c{i}", skills=["react"], last_active_ts=100 - i) for i in range(5)]
+    patch_ts_search(db)
+    result = await search_api._search_impl(
+        {"filters": chips(nice=["react", "vue"]), "page": 1, "per_page": 10}, avatar_proxy=True,
+    )
+    assert result["count_capped"] is True
+    assert result["total"] == 5  # true Typesense `found` — always exact for this (non-Tier-B) path
+
+
 async def test_keyword_and_skills_compose_together(patch_ts_search):
     """keyword (Tier A, via q) and MUST/EXCLUDE (via filter_by) must both apply."""
     db = [
