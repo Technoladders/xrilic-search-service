@@ -21,6 +21,7 @@ real timestamp column name against the live schema before relying on it,
 since batch ids are UUIDs and are not sortable by insertion order.
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -29,6 +30,8 @@ import httpx
 
 from ..config import SB_HEADERS, SUPABASE_REST, HTTP_TIMEOUT_SUPABASE
 from .config import SOURCE, DEFAULT_BATCH_SIZE, DEFAULT_CONCURRENCY, CLAIM_STALE_AFTER_SEC
+
+logger = logging.getLogger(__name__)
 
 PROCESS_NAME = SOURCE  # "portal_a" -- matches the control table's default
 
@@ -156,24 +159,93 @@ async def heartbeat(client: httpx.AsyncClient, instance_id: str) -> None:
     })
 
 
+def _parse_iso(v: Optional[str]) -> Optional[datetime]:
+    if v is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 async def try_claim(client: httpx.AsyncClient, instance_id: str) -> bool:
-    """Atomic conditional claim: succeeds only if no other instance
-    currently holds a fresh (<CLAIM_STALE_AFTER_SEC) heartbeat. Used both
-    by /start (immediate) and claim_watchdog() (periodic retry) -- see
-    worker.py. Returns True iff this call's claim succeeded."""
-    stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=CLAIM_STALE_AFTER_SEC)).isoformat()
-    r = await client.patch(
+    """Read-then-compare-and-swap claim, mirroring backfill/match.py's
+    optimistic-concurrency merge pattern (_merge_into_existing) rather than
+    an inequality comparison embedded inside a PostgREST `or=(...)` filter
+    string.
+
+    ROOT CAUSE this replaces: the previous implementation issued a single
+    conditional PATCH with
+      process_name=eq.<x>&desired_state=eq.running&or=(worker_heartbeat_at.is.null,worker_heartbeat_at.lt.<cutoff>)
+    and treated an empty `Prefer: return=representation` response as
+    "someone else's heartbeat is still fresh". In production this returned
+    an empty response on every single attempt, for minutes at a stretch,
+    even against a heartbeat that was unambiguously more than
+    CLAIM_STALE_AFTER_SEC old by wall-clock comparison against the value
+    /status was independently reporting moments earlier -- i.e. the
+    inequality-in-a-compound-OR-filter was not matching rows it should
+    have matched, and there was no way to observe *why* from outside
+    Postgres/PostgREST, since a 0-row match and an RLS-filtered match are
+    both indistinguishable 200-with-empty-body responses. Rather than
+    keep guessing at the exact byte-level cause of that specific filter
+    combination, this version removes the entire class of risk: read the
+    row explicitly, decide staleness with a plain Python datetime
+    comparison (fully logged, fully unit-testable), and only ever send
+    PostgREST an exact-value filter (`eq.<value>` or `is.null`) for the
+    actual claim PATCH -- the same kind of filter every other write in
+    this codebase already uses successfully (e.g. desired_state=eq.running
+    itself works fine everywhere else it's used).
+
+    Still race-safe: two instances can both pass the staleness check in
+    Python from a similarly-stale read, but the final PATCH is a
+    compare-and-swap keyed on the EXACT worker_heartbeat_at value each one
+    read -- only the first PATCH to land actually changes that column
+    (bumping it to a fresh timestamp), so the second one's `eq.<stale
+    value>` filter no longer matches and it correctly gets an empty
+    response, i.e. still loses the race deterministically."""
+    r = await client.get(
+        f"{SUPABASE_REST}/master_candidates_backfill_control",
+        params={"process_name": f"eq.{PROCESS_NAME}", "select": "desired_state,worker_heartbeat_at"},
+        headers=SB_HEADERS, timeout=HTTP_TIMEOUT_SUPABASE)
+    r.raise_for_status()
+    rows = r.json()
+    if not rows:
+        logger.warning(f"[mc-backfill] try_claim: no control row found for process_name={PROCESS_NAME}")
+        return False
+    row = rows[0]
+
+    if row.get("desired_state") != "running":
+        logger.info(f"[mc-backfill] try_claim: desired_state={row.get('desired_state')!r}, not 'running' -- not claiming")
+        return False
+
+    current_heartbeat_raw = row.get("worker_heartbeat_at")
+    current_heartbeat = _parse_iso(current_heartbeat_raw)
+    now = datetime.now(timezone.utc)
+    is_eligible = current_heartbeat is None or (now - current_heartbeat) > timedelta(seconds=CLAIM_STALE_AFTER_SEC)
+    logger.info(
+        f"[mc-backfill] try_claim: desired_state=running, "
+        f"current_heartbeat={current_heartbeat_raw!r}, age_sec="
+        f"{(now - current_heartbeat).total_seconds() if current_heartbeat else 'null'}, "
+        f"eligible={is_eligible}"
+    )
+    if not is_eligible:
+        return False
+
+    cas_filter = "is.null" if current_heartbeat_raw is None else f"eq.{current_heartbeat_raw}"
+    patch_r = await client.patch(
         f"{SUPABASE_REST}/master_candidates_backfill_control",
         params={
             "process_name": f"eq.{PROCESS_NAME}",
             "desired_state": "eq.running",
-            "or": f"(worker_heartbeat_at.is.null,worker_heartbeat_at.lt.{stale_cutoff})",
+            "worker_heartbeat_at": cas_filter,
         },
         headers={**SB_HEADERS, "Prefer": "return=representation"},
-        json={"worker_instance_id": instance_id, "worker_heartbeat_at": datetime.now(timezone.utc).isoformat()},
+        json={"worker_instance_id": instance_id, "worker_heartbeat_at": now.isoformat()},
         timeout=HTTP_TIMEOUT_SUPABASE)
-    r.raise_for_status()
-    return bool(r.json())
+    patch_r.raise_for_status()
+    claimed = bool(patch_r.json())
+    logger.info(f"[mc-backfill] try_claim: compare-and-swap PATCH claimed={claimed}")
+    return claimed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
