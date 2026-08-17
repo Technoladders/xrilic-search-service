@@ -41,10 +41,6 @@ from master_candidates import (
 from master_candidates.backfill import api as mc_backfill_api
 from master_candidates.backfill import worker as mc_backfill_worker
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
 logger = logging.getLogger("sync_service")
 
 TYPESENSE_HOST      = os.environ["TYPESENSE_HOST"]
@@ -63,6 +59,21 @@ poller:  SyncPoller       = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global indexer, poller
+
+    # Re-applied here (not at module import time) with force=True: uvicorn
+    # configures its own logging (defaulting to disable_existing_loggers)
+    # either before or interleaved with importing this module, which was
+    # silently disabling every application logger created via basicConfig()/
+    # getLogger() at import time (sync_service, master_candidates.*, incl.
+    # master_candidates.backfill.worker) -- httpx's own logger kept working
+    # only because it's created lazily, on first request, well after that
+    # point. lifespan() is guaranteed to run after uvicorn's own logging
+    # setup, so force=True here reliably wins regardless of import order.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
+    )
 
     logger.info("Starting xrilic-search-service...")
 
