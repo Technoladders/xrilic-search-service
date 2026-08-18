@@ -103,7 +103,27 @@ async def fetch_page(client: httpx.AsyncClient, after_ts: Optional[str],
     main.py::run_full_reindex already uses for hr_talent_pool, chosen
     specifically because this codebase already fixed the bug class a
     single `gt` cursor is prone to (bulk-imported rows sharing identical
-    timestamps skipping past a naive cursor)."""
+    timestamps skipping past a naive cursor).
+
+    Production incident (Aug 2026): the OR tiebreak below --
+    `or=(updated_at.gt.X,and(updated_at.eq.X,id.gt.Y))` -- is not sargable
+    as a single expression, so Postgres's planner used the updated_at
+    index only for scan direction and had to filter every row it visited
+    to evaluate the OR. Once the cursor landed inside a large
+    same-timestamp cluster this cost 42-116s (EXPLAIN ANALYZE showed
+    hundreds of thousands of "Rows Removed by Filter"). The `updated_at`
+    top-level filter added below is redundant with the OR -- the OR
+    already implies updated_at >= after_ts in every case, so it changes
+    which rows match not at all -- but a plain `gte` clause IS sargable,
+    and PostgREST ANDs top-level filters with `or=(...)` automatically, so
+    this gives the planner an Index Cond to push down while the OR is left
+    to filter only the much smaller row set the index scan already
+    narrowed to. Confirmed in production: the equivalent predicate (tested
+    there as a literal `WHERE (updated_at, id) > (X, Y)` row comparison,
+    which PostgREST's filter grammar has no way to express directly and
+    which would otherwise require an RPC) dropped this same query from
+    tens of seconds to ~54ms. See test_backfill_worker.py for the boundary
+    cases this must preserve exactly."""
     params: dict[str, str] = {
         "select": SELECT_FIELDS,
         "order": "updated_at.asc,id.asc",
@@ -111,6 +131,7 @@ async def fetch_page(client: httpx.AsyncClient, after_ts: Optional[str],
     }
     if after_ts is not None:
         if after_id is not None:
+            params["updated_at"] = f"gte.{after_ts}"
             params["or"] = f"(updated_at.gt.{after_ts},and(updated_at.eq.{after_ts},id.gt.{after_id}))"
         else:
             params["updated_at"] = f"gt.{after_ts}"

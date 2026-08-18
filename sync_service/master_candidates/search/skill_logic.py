@@ -94,3 +94,67 @@ def nice_match_count(skills_field: list[str] | None, nice: list[str]) -> int:
     doc_skills = {str(s).lower() for s in (skills_field or [])}
     nice_lower = {s.lower() for s in nice}  # nice is already normalize_skill()'d; .lower() here is a no-op safety net
     return len(doc_skills & nice_lower)
+
+
+# ── Two-bucket MUST+NICE tiering ────────────────────────────────────────────
+# When both MUST and NICE are set, the single `(ALL must) OR (ANY nice)`
+# inclusion filter loses the "how MUST-complete is this candidate" signal
+# needed to rank MUST-complete candidates strictly ahead of partial/NICE-only
+# ones. Splitting into two disjoint, exact Typesense filters lets each be
+# ranked and paginated independently, in O(N) filter length (N = len(must)),
+# not the O(2^N) a per-match-count combinatorial filter would need:
+#
+#   Bucket A (MUST-complete, regardless of nice): the existing must_clause.
+#   Bucket B (NOT MUST-complete, but NICE-qualified): De Morgan's law turns
+#     NOT(m1 AND m2 AND ... AND mN) into (NOT m1) OR (NOT m2) OR ... OR
+#     (NOT mN) — expressible with Typesense's native `!=`/`||`, since a
+#     general boolean NOT of a compound filter_by expression isn't supported,
+#     but per-field `!=` combined with `||` is (already used for EXCLUDE).
+#
+# A candidate can't simultaneously satisfy every must value (Bucket A) and
+# fail at least one (Bucket B) — the two buckets are provably disjoint, so
+# `total = countA + countB` needs no dedup, unlike keyword Tier-B's union.
+
+
+def build_must_complete_filter(skills: SkillCriteria) -> str | None:
+    """Bucket A's inclusion clause — identical to the plain MUST-only filter."""
+    return _must_clause(skills.must)
+
+
+def build_must_partial_or_none_filter(must: list[str]) -> str | None:
+    """
+    NOT(m1 AND m2 AND ... AND mN) via De Morgan's law, i.e. "fails at least
+    one must value" — the negated half of Bucket B's inclusion clause.
+    None when `must` is empty (there's nothing to be "not all of").
+    Collapses to a single clause (no `||`) when len(must) == 1.
+    """
+    if not must:
+        return None
+    return " || ".join(f"skills:!={_escape(v)}" for v in must)
+
+
+def build_bucket_b_inclusion_filter(skills: SkillCriteria) -> str | None:
+    """
+    Bucket B's full inclusion clause: NOT MUST-complete, AND NICE-qualified.
+    None when either side is empty — Bucket B only exists when BOTH must and
+    nice are set (MUST-only or NICE-only queries have no partial-MUST tier
+    to carve out; see search_api.py's gating on this).
+    """
+    partial = build_must_partial_or_none_filter(skills.must)
+    nice_clause = _nice_clause(skills.nice)
+    if not partial or not nice_clause:
+        return None
+    return f"({partial}) && ({nice_clause})"
+
+
+def must_partial_match_count(skills_field: list[str] | None, must: list[str]) -> int:
+    """
+    Case-insensitive count of how many MUST skills a (necessarily
+    not-fully-matching) Bucket B candidate still happens to have — mirrors
+    nice_match_count exactly, just against the must set. Ranking only.
+    """
+    if not must:
+        return 0
+    doc_skills = {str(s).lower() for s in (skills_field or [])}
+    must_lower = {s.lower() for s in must}
+    return len(doc_skills & must_lower)

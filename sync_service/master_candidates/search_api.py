@@ -91,8 +91,9 @@ from .config import (
 )
 from .typesense_client import QUERY_BY, QUERY_BY_WEIGHTS, get_document
 from .search import keyword_query, skill_logic
+from .search.bucket_pagination import compute_bucket_slice
 from .search.query_types import KeywordSyntaxError, SearchPlan
-from .search.ranking import fetch_bounded_pool, rank_key
+from .search.ranking import fetch_bounded_pool, fetch_direct_slice, rank_key, rank_key_bucket_b
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mc", tags=["master_candidates"])
@@ -263,6 +264,22 @@ def _combined_filter_by(plan: SearchPlan) -> str:
     return " && ".join(
         p for p in [inclusion, plan.exclude_filter_by, plan.other_hard_filter_by] if p
     )
+
+
+def _bucket_filter(inclusion: str | None, plan: SearchPlan) -> str:
+    """Same AND-composition as _combined_filter_by, for one bucket's own
+    inclusion clause instead of the combined (ALL must) OR (ANY nice) one."""
+    parts = [f"({inclusion})"] if inclusion else []
+    if plan.exclude_filter_by:
+        parts.append(plan.exclude_filter_by)
+    if plan.other_hard_filter_by:
+        parts.append(plan.other_hard_filter_by)
+    return " && ".join(parts)
+
+
+async def _count_only(params: dict[str, Any]) -> int:
+    data = await _ts_search({**params, "page": 1, "per_page": 1})
+    return data.get("found", 0)
 
 
 def _loads(s: Any) -> list:
@@ -468,6 +485,96 @@ def _log_search(plan: SearchPlan, filter_by: str, q: str, tier: str,
     )
 
 
+async def _search_two_bucket(
+    plan: SearchPlan, page: int, per_page: int, base_params: dict[str, Any],
+    tier: str, exact_q: Optional[str],
+) -> tuple[list[dict], int, bool, Optional[float]]:
+    """
+    MUST-completeness-first ranking: entered only when BOTH must and nice
+    are set (see _search_impl's gating) and keyword tier != "B" (that
+    combination is an explicit, documented, tested follow-up — see the
+    implementation plan's Edge Cases). Two disjoint, exact Typesense
+    filters instead of one combined OR filter:
+
+      Bucket A: ALL must matched (regardless of nice) — ranked by
+                nice_match_count (existing rank_key, unchanged).
+      Bucket B: NOT all must matched, but NICE-qualified — ranked by
+                must_partial_match_count first, then nice_match_count
+                (rank_key_bucket_b).
+
+    Bucket routing (which bucket a page's data comes from) is decided
+    ONLY by each bucket's EXACT count (countA/countB), never by whether a
+    bucket's own ranking pool was exceeded — that's the critical invariant
+    from the implementation plan: a bucket exceeding RERANK_POOL_HARD_CAP
+    only degrades that bucket's OWN ranking to native order for the
+    portion beyond its pool depth (via fetch_direct_slice, which stays
+    scoped to that bucket's own filter_by) — it can never cause the other
+    bucket's candidates to appear out of order.
+
+    Returns (ordered_hits, total, count_capped, took_ms) — the caller
+    builds the final response dict so the frozen contract lives in one place.
+    """
+    q = exact_q if tier == "A" else "*"
+    common_params = {**base_params, "q": q}
+    if tier == "A":
+        common_params["drop_tokens_threshold"] = 0
+
+    filter_a = _bucket_filter(skill_logic.build_must_complete_filter(plan.skills), plan)
+    filter_b = _bucket_filter(skill_logic.build_bucket_b_inclusion_filter(plan.skills), plan)
+
+    params_a = {**common_params, "filter_by": filter_a}
+    params_b = {**common_params, "filter_by": filter_b}
+
+    needed_a = page * per_page
+    hits_a_pool, found_a, _facets_a, took_ms = await fetch_bounded_pool(
+        _ts_search, params_a, needed_a, RERANK_POOL_HARD_CAP, TYPESENSE_MAX_PER_PAGE,
+    )
+
+    slice_ = compute_bucket_slice(page, per_page, found_a)
+    capped = False
+
+    hits_a: list[dict] = []
+    if slice_.needs_a:
+        if needed_a <= RERANK_POOL_HARD_CAP:
+            ranked_a = sorted(hits_a_pool, key=lambda h: rank_key(h, plan.skills.nice))
+            hits_a = ranked_a[slice_.a_offset: slice_.a_offset + slice_.a_limit]
+        else:
+            hits_a, _ = await fetch_direct_slice(
+                _ts_search, params_a, "last_active_date_ts:desc,data_freshness_ts:desc",
+                slice_.a_offset, slice_.a_limit,
+            )
+            capped = True
+
+    # found_b is needed for an accurate `total` regardless of whether this
+    # specific page touches Bucket B at all.
+    found_b = await _count_only(params_b)
+
+    hits_b: list[dict] = []
+    if slice_.needs_b:
+        needed_b = slice_.b_offset + slice_.b_limit
+        if needed_b <= RERANK_POOL_HARD_CAP:
+            hits_b_pool, _found_b_pool, _facets_b, _took_b = await fetch_bounded_pool(
+                _ts_search, params_b, needed_b, RERANK_POOL_HARD_CAP, TYPESENSE_MAX_PER_PAGE,
+            )
+            ranked_b = sorted(
+                hits_b_pool,
+                key=lambda h: rank_key_bucket_b(h, plan.skills.must, plan.skills.nice),
+            )
+            hits_b = ranked_b[slice_.b_offset: slice_.b_offset + slice_.b_limit]
+        else:
+            hits_b, _ = await fetch_direct_slice(
+                _ts_search, params_b, "last_active_date_ts:desc,data_freshness_ts:desc",
+                slice_.b_offset, slice_.b_limit,
+            )
+            capped = True
+
+    logger.info(
+        f"mc_search_bucket bucket_a_count={found_a} bucket_b_count={found_b} "
+        f"page={page} per_page={per_page} count_capped={capped}"
+    )
+    return hits_a + hits_b, found_a + found_b, capped, took_ms
+
+
 async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str, Any]:
     """
     Shared by /mc/search (avatar_proxy=False) and /mc/search_v2
@@ -530,6 +637,31 @@ async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str,
         "highlight_fields": "full_name,title,skills_text",
         "exclude_fields":   EXCLUDE_FIELDS,
     }
+
+    # MUST-completeness-first ranking: when both MUST and NICE are set, the
+    # single combined (ALL must) OR (ANY nice) filter can't express "how
+    # MUST-complete is this candidate," so a NICE-only candidate could
+    # outrank a MUST-complete one on recency alone. Two-bucket tiering
+    # fixes this — see _search_two_bucket. Excluded for keyword tier "B"
+    # (OR/parens): combining bucket tiering with the bounded keyword-OR
+    # evaluator is an explicit, documented follow-up (implementation plan,
+    # Edge Cases) — that combination keeps today's single-filter behavior
+    # rather than silently dropping MUST-first ordering or crashing.
+    if plan.skills.must and plan.skills.nice and tier != "B":
+        hits, found, capped, took_ms = await _search_two_bucket(
+            plan, page, per_page, base_params, tier, exact_q,
+        )
+        _log_search(plan, filter_by, exact_q if tier == "A" else "*", tier, found, took_ms,
+                    capped, (_time.monotonic() - start_time) * 1000)
+        return {
+            "profiles":     [_to_rr_profile(h, avatar_proxy) for h in hits],
+            "total":        found,
+            "page":         page,
+            "per_page":     per_page,
+            "facets":       [],
+            "took_ms":      took_ms,
+            "count_capped": capped,
+        }
 
     # Nice-match-count ranking only differentiates candidates when it can
     # take more than one value among the candidates that pass the inclusion

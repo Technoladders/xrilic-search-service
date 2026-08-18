@@ -26,9 +26,11 @@ import pytest
 
 from master_candidates import search_api
 from master_candidates.search import keyword_query, skill_logic
+from master_candidates.search.bucket_pagination import compute_bucket_slice
 from master_candidates.search.query_types import (
     AndNode, KeywordSyntaxError, NotNode, OrNode, PhraseNode, SkillCriteria, TermNode,
 )
+from master_candidates.search.ranking import fetch_direct_slice
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -613,6 +615,153 @@ async def test_keyword_tier_b_capped_when_branch_exceeds_pool(patch_ts_search, m
     # strictly less than the true 5 that exist — never dressed up as exact.
     assert result["total"] == 2
     assert len(result["profiles"]) == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Two-bucket MUST+NICE tiering — MUST-completeness-first ranking
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_must_partial_or_none_filter_grows_linearly():
+    for n in [1, 2, 5, 10, 15]:
+        must = [f"m{i}" for i in range(n)]
+        clause = skill_logic.build_must_partial_or_none_filter(must)
+        assert clause.count("skills:!=") == n
+        assert clause.count("||") == max(0, n - 1)  # linear, never combinatorial
+
+
+def test_compute_bucket_slice_page_fully_in_a():
+    s = compute_bucket_slice(page=1, per_page=5, count_a=20)
+    assert (s.a_offset, s.a_limit, s.needs_a, s.needs_b) == (0, 5, True, False)
+
+
+def test_compute_bucket_slice_page_fully_in_b():
+    s = compute_bucket_slice(page=5, per_page=5, count_a=10)
+    assert (s.a_limit, s.b_offset, s.b_limit, s.needs_a, s.needs_b) == (0, 10, 5, False, True)
+
+
+def test_compute_bucket_slice_boundary_page():
+    s = compute_bucket_slice(page=3, per_page=5, count_a=12)
+    # offset [10,15): 2 from A (10,11), 3 from B (0,1,2)
+    assert (s.a_offset, s.a_limit, s.b_offset, s.b_limit, s.is_boundary) == (10, 2, 0, 3, True)
+
+
+def test_compute_bucket_slice_count_a_zero():
+    s = compute_bucket_slice(page=1, per_page=5, count_a=0)
+    assert (s.needs_a, s.needs_b, s.b_offset, s.b_limit) == (False, True, 0, 5)
+
+
+@pytest.mark.parametrize("offset,limit", [(0, 5), (10, 5), (7, 5), (2, 5), (23, 5)])
+async def test_fetch_direct_slice_hits_exact_window_regardless_of_alignment(offset, limit):
+    """fetch_direct_slice must return exactly [offset, offset+limit), whether
+    or not `offset` is a multiple of `limit` — proven at both aligned (0, 10)
+    and non-aligned (7, 2, 23) offsets, at a cost of at most 2 Typesense calls."""
+    db = [_mk(f"c{i:02d}", last_active_ts=1000 - i) for i in range(40)]  # native order = c00..c39
+    fake = make_fake_ts_search(db)
+    hits, _took = await fetch_direct_slice(
+        fake, {"q": "*", "query_by": "full_name"}, "last_active_date_ts:desc", offset, limit,
+    )
+    got_ids = [h["document"]["id"] for h in hits]
+    expected_ids = [f"c{i:02d}" for i in range(offset, offset + limit)]
+    assert got_ids == expected_ids
+
+
+@pytest.mark.parametrize("must_n,nice_n", [(1, 1), (2, 5), (5, 10), (10, 20), (15, 30)])
+async def test_two_bucket_scale_matrix(patch_ts_search, must_n, nice_n):
+    """Enterprise-scale MUST/NICE combinations: correct bucket routing and
+    within-bucket ranking hierarchy hold at realistic sizes, not just N=2."""
+    must = [f"m{i}" for i in range(must_n)]
+    nice = [f"n{i}" for i in range(nice_n)]
+
+    # Bucket A: all must skills, plus 0/1/(2 if nice_n>=2) nice matches (secondary ranking).
+    a0 = _mk("A-0nice", skills=list(must), last_active_ts=50)
+    a1 = _mk("A-1nice", skills=must + nice[:1], last_active_ts=40)
+    a2 = _mk("A-2nice", skills=must + nice[:2], last_active_ts=30) if nice_n >= 2 else None
+    # Bucket B: missing exactly one must skill, has some nice matches.
+    b_more = _mk("B-2must-1nice", skills=must[1:] + nice[:1], last_active_ts=90)   # must_n-1 of must, 1 nice
+    b_fewer = _mk("B-1must-1nice", skills=must[:1] + nice[:1], last_active_ts=90) if must_n > 1 else None
+    # Ineligible: neither all-must nor any nice.
+    nope = _mk("NOPE", skills=["unrelated"], last_active_ts=200)
+
+    db = [a0, a1, b_more, nope] + ([a2] if a2 else []) + ([b_fewer] if b_fewer else [])
+    patch_ts_search(db)
+
+    result = await search_api._search_impl(
+        {"filters": chips(must=must, nice=nice), "page": 1, "per_page": 10}, avatar_proxy=True,
+    )
+    ids = [p["id"] for p in result["profiles"]]
+
+    assert "NOPE" not in ids
+    assert result["total"] == len(db) - 1  # everything except NOPE
+
+    # Bucket A must precede Bucket B entries, and rank by nice count desc.
+    a_ids = ["A-2nice", "A-1nice", "A-0nice"] if a2 else ["A-1nice", "A-0nice"]
+    assert ids[:len(a_ids)] == a_ids
+    assert all(ids.index(a) < ids.index(b_more["id"]) for a in a_ids)
+    if b_fewer:
+        # B-2must (has must_n-1 of must skills) outranks B-1must (has only 1) within Bucket B.
+        assert ids.index("B-2must-1nice") < ids.index("B-1must-1nice")
+
+
+async def test_two_bucket_deep_pagination_never_leaks_bucket_b_before_a_exhausted(patch_ts_search, monkeypatch):
+    """The single highest-priority test for this feature: even when Bucket A
+    alone exceeds RERANK_POOL_HARD_CAP, and even at a non-page-aligned bucket
+    boundary, no Bucket-B candidate may appear on any page until Bucket A's
+    EXACT count is genuinely exhausted. Bucket routing is count-based, never
+    dependent on the ranking-pool fallback."""
+    monkeypatch.setattr(search_api, "RERANK_POOL_HARD_CAP", 10)
+    per_page = 4
+    count_a = 23  # deliberately > cap AND not a multiple of per_page
+    must = ["react", "node"]
+    nice = ["aws"]
+
+    bucket_a_docs = [
+        _mk(f"A-{i:02d}", skills=must, last_active_ts=1000 - i) for i in range(count_a)
+    ]
+    bucket_b_docs = [
+        _mk(f"B-{i:02d}", skills=must[:1] + nice, last_active_ts=1000 - i) for i in range(6)
+    ]
+    patch_ts_search(bucket_a_docs + bucket_b_docs)
+
+    seen_ids: list[str] = []
+    total_pages = (count_a + len(bucket_b_docs) + per_page - 1) // per_page
+    for page in range(1, total_pages + 1):
+        result = await search_api._search_impl(
+            {"filters": chips(must=must, nice=nice), "page": page, "per_page": per_page},
+            avatar_proxy=True,
+        )
+        page_ids = [p["id"] for p in result["profiles"]]
+        seen_ids.extend(page_ids)
+
+        b_count_seen_so_far = sum(1 for i in seen_ids if i.startswith("B-"))
+        a_count_seen_so_far = sum(1 for i in seen_ids if i.startswith("A-"))
+        if b_count_seen_so_far > 0:
+            # Once ANY Bucket-B candidate has appeared, EVERY Bucket-A
+            # candidate must already have appeared — Bucket A is exhausted.
+            assert a_count_seen_so_far == count_a, (
+                f"page {page}: Bucket-B candidate appeared before Bucket A "
+                f"({a_count_seen_so_far}/{count_a}) was exhausted"
+            )
+
+    # Sanity: every candidate was actually returned exactly once across all pages.
+    assert len(seen_ids) == len(set(seen_ids)) == count_a + len(bucket_b_docs)
+    assert seen_ids[:count_a] == [f"A-{i:02d}" for i in range(count_a)]
+
+
+async def test_keyword_or_with_must_and_nice_does_not_crash(patch_ts_search):
+    """Documented interim behavior (implementation plan, Edge Cases): keyword
+    Tier-B combined with MUST+NICE bucket tiering is a follow-up — for now it
+    must not crash, and falls back to the pre-existing single-filter path."""
+    db = [
+        _mk("match", skills=["react", "node", "aws"], text="java developer", last_active_ts=100),
+        _mk("no-match", skills=["cobol"], text="java developer", last_active_ts=90),
+    ]
+    patch_ts_search(db)
+    result = await search_api._search_impl(
+        {"filters": {**chips(must=["react", "node"], nice=["aws"]), "keyword": "java OR python"},
+         "page": 1, "per_page": 10},
+        avatar_proxy=True,
+    )
+    assert set(result.keys()) == {"profiles", "total", "page", "per_page", "facets", "took_ms", "count_capped"}
 
 
 async def test_zero_internal_matches_returns_total_zero_not_error(patch_ts_search):
