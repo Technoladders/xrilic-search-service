@@ -24,8 +24,9 @@ from .config import (
     SB_HEADERS, SUPABASE_REST, HTTP_TIMEOUT_SUPABASE, WEBHOOK_SECRET,
 )
 from .indexer import index_ids
-from .typesense_client import sync_synonyms, ensure_fields
+from .typesense_client import sync_synonyms, ensure_fields, ensure_suggestions_collection
 from .ingest import WEBHOOK_QUEUE
+from .suggestions_aggregator import rebuild_suggestions
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mc", tags=["master_candidates_admin"])
@@ -131,6 +132,32 @@ async def admin_ensure_fields(
     background_tasks.add_task(_run)
     return {"ok": True, "message": "Schema migration started in background — "
                                     "watch logs or poll GET /mc/health."}
+
+
+# ── Admin: rebuild the search-suggestions collection ───────────────────────
+# Manual-trigger only (implementation plan, Part 2) — no cron/background
+# loop added by this change. Reads master_candidates_v1 via Typesense's own
+# bulk export (never touches Postgres, never affects /mc/search_v2), writes
+# only to the separate suggestions collection.
+@router.post("/admin/suggestions/rebuild")
+async def admin_suggestions_rebuild(
+    background_tasks: BackgroundTasks,
+    token: str = Depends(require_admin),
+) -> dict[str, Any]:
+    async def _run():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                await ensure_suggestions_collection(client)
+                report = await rebuild_suggestions(client)
+            logger.info(
+                f"[mc] suggestions rebuild completed: "
+                f"processed={report.documents_processed} rows={len(report.rows)}"
+            )
+        except Exception as e:
+            logger.exception(f"[mc] suggestions rebuild failed: {e}")
+    background_tasks.add_task(_run)
+    return {"ok": True, "message": "Suggestions rebuild started in background — "
+                                    "watch logs for completion."}
 
 
 # ── Webhook: naukri-save posts here AFTER merge_naukri_candidates succeeds ─

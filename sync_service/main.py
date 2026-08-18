@@ -35,6 +35,7 @@ from master_candidates import (
     typesense_client as mc_ts,
     indexer as mc_indexer,
     search_api as mc_search,
+    suggestions_api as mc_suggestions,
     admin_api as mc_admin,
     ingest as mc_ingest,
 )
@@ -177,6 +178,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(mc_search.router)
+app.include_router(mc_suggestions.router)
 app.include_router(mc_admin.router)
 app.include_router(mc_backfill_api.router)
 

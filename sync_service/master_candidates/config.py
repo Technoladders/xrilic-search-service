@@ -29,6 +29,15 @@ TS_HEADERS = {
 }
 TS_COLLECTION = os.environ.get("MC_COLLECTION_NAME", "master_candidates_v1")
 
+# Dedicated suggestion/autocomplete collection — deliberately separate from
+# TS_COLLECTION so autocomplete never queries the 1M+ candidate collection at
+# request time (see suggestions_aggregator.py / suggestions_api.py). Point
+# this at a "_dev" name while developing/testing; the production collection
+# name is only used once rollout is explicitly approved.
+TS_SUGGESTIONS_COLLECTION = os.environ.get(
+    "MC_SUGGESTIONS_COLLECTION_NAME", "master_candidate_suggestions_v1"
+)
+
 # ── Webhook / admin auth (reused from main service) ────────────────────────
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 ADMIN_SECRET   = os.environ["ADMIN_SECRET"]

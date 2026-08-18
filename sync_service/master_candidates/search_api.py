@@ -218,6 +218,29 @@ def _build_other_hard_filters(f: dict[str, Any]) -> str:
     if p := _filter_any("degrees", f.get("degree") or []):
         parts.append(p)
 
+    # Enterprise filter dimensions (search-suggestions project) — same
+    # _filter_any() OR-array pattern as location/schools/degrees above.
+    # The 7 future-analytics-only fields (gender, age_years, marital_status,
+    # disability, desired_job_type, employment_status_pref,
+    # work_auth_countries) deliberately have NO filter clause here yet.
+    if p := _filter_any("industry", f.get("industries") or []):
+        parts.append(p)
+    if p := _filter_any("job_function", f.get("jobFunctions") or []):
+        parts.append(p)
+    if p := _filter_any("functional_area", f.get("functionalAreas") or []):
+        parts.append(p)
+    if p := _filter_any("company_industry", f.get("companyIndustries") or []):
+        parts.append(p)
+    if p := _filter_any("seniority", f.get("seniorities") or []):
+        parts.append(p)
+    # Filters on languages_filter (the new, filterable/faceted sibling field)
+    # — production's existing `languages` field stays retrieve-only and
+    # untouched; the frontend-facing filter key is still called "languages"
+    # since that's just the request-body field name, unrelated to which
+    # Typesense schema field actually backs it.
+    if p := _filter_any("languages_filter", f.get("languages") or []):
+        parts.append(p)
+
     y_min, y_max = _parse_years_bucket(f.get("yearsExperience"))
     if y_min is not None:
         parts.append(f"total_experience_months:>={y_min*12}")

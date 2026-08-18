@@ -9,6 +9,7 @@ Two things live here:
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,10 +25,22 @@ logger = logging.getLogger(__name__)
 # ── Selected columns pulled from master_candidates ─────────────────────────
 # Everything the transformer needs; nothing huge (no raw_profile_by_source,
 # no full experience/education arrays — those stay in Postgres for detail view).
+#
+# job_function/company_industry/gender/dob/marital_status/disability/
+# desired_job_type/employment_status_pref/work_auth_countries were added
+# after confirming their exact column definitions against the real
+# `master_candidates` DDL (see verify_master_candidates_columns.py for the
+# live-database consistency check) — see transform_row() for how each is
+# mapped; several need parsing (dob is free-text, not a date column;
+# desired_job_type/employment_status_pref are single delimited text columns,
+# not arrays).
 SELECT_COLUMNS = ",".join([
     "id","primary_source","sources","linkedin_url","full_name","title","headline",
     "summary","profile_picture_url","location","country","industry","seniority",
     "followers","company_name","current_location","functional_area","role",
+    "job_function","company_industry",
+    "gender","dob","marital_status","disability",
+    "desired_job_type","employment_status_pref","work_auth_countries",
     "skills","experience","education","certifications","languages","contact_availability",
     "available_emails","available_phones","preferred_locations",
     "current_ctc_lacs","expected_ctc_lacs","current_ctc_display",
@@ -58,6 +71,43 @@ def _truncate(s: Any, n: int) -> str | None:
         return None
     s = str(s)
     return s if len(s) <= n else s[:n]
+
+
+# dob is stored as free-text (e.g. "12 Apr 1988"), not a Postgres date column
+# — a handful of common formats covers what's been observed; anything else
+# (or missing/garbage dob) falls back to None rather than raising, so one
+# malformed row never blocks indexing the rest of the document.
+_DOB_FORMATS = ["%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%m/%d/%Y"]
+
+
+def _parse_age_years(dob: Any) -> int | None:
+    """Future-analytics field only (see implementation plan) — never exposed
+    as a search filter in this pass. Age is computed relative to indexing
+    time, not stored/cached, so it stays correct as documents get reindexed."""
+    if not dob:
+        return None
+    s = str(dob).strip()
+    for fmt in _DOB_FORMATS:
+        try:
+            born = datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        today = datetime.now(timezone.utc).replace(tzinfo=None)
+        years = today.year - born.year - ((today.month, today.day) < (born.month, born.day))
+        return years if 0 <= years <= 120 else None
+    return None
+
+
+def _split_multi_value(raw: Any) -> list[str]:
+    """desired_job_type/employment_status_pref are single TEXT columns that
+    can encode multiple preferences in one delimited string (e.g. observed:
+    "Permanent / Temporary") rather than a real Postgres array — heuristic
+    split on '/' and ',', trimmed, empties dropped. Never raises. Worth
+    spot-checking against more live rows if the delimiter convention turns
+    out to vary."""
+    if not raw:
+        return []
+    return [p.strip() for p in re.split(r"[/,]", str(raw)) if p.strip()]
 
 
 def transform_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -108,6 +158,30 @@ def transform_row(row: dict[str, Any]) -> dict[str, Any]:
         "seniority":        row.get("seniority"),
         "country":          row.get("country"),
 
+        # Fix: these two were already selected from Postgres above but never
+        # actually written into the Typesense doc — a pre-existing gap found
+        # during the search-suggestions investigation.
+        "industry":         row.get("industry"),
+        "functional_area":  row.get("functional_area"),
+
+        # Confirmed live suggestion dimensions (5 of the 15) — same "eventually
+        # facet + filter" treatment as seniority/country.
+        "job_function":     row.get("job_function"),
+        "company_industry": row.get("company_industry"),
+
+        # Future-analytics-only fields (see implementation plan) — indexed
+        # now so a later analytics/filter feature doesn't need a second
+        # schema migration, but NOT exposed as search filters or suggestion
+        # dimensions in this pass. Raw `dob` itself is deliberately never
+        # sent to Typesense — only the derived age.
+        "gender":                 row.get("gender"),
+        "age_years":              _parse_age_years(row.get("dob")),
+        "marital_status":         row.get("marital_status"),
+        "disability":             row.get("disability"),
+        "desired_job_type":       _split_multi_value(row.get("desired_job_type")),
+        "employment_status_pref": _split_multi_value(row.get("employment_status_pref")),
+        "work_auth_countries":    list(row.get("work_auth_countries") or []),
+
         "total_experience_months": row.get("total_experience_months") or 0,
         "current_ctc_lacs":        float(row["current_ctc_lacs"]) if row.get("current_ctc_lacs") is not None else None,
         "expected_ctc_lacs":       float(row["expected_ctc_lacs"]) if row.get("expected_ctc_lacs") is not None else None,
@@ -117,6 +191,13 @@ def transform_row(row: dict[str, Any]) -> dict[str, Any]:
         "last_active_date_ts":     _to_ts(row.get("last_active_date")),
 
         "languages":              [l.get("name") for l in (row.get("languages") or [])
+                                   if isinstance(l, dict) and l.get("name")],
+        # Separate, brand-new field carrying the IDENTICAL data as
+        # `languages` above — production's existing `languages` field stays
+        # retrieve-only and untouched; this filterable/faceted sibling is
+        # what search_api.py's languages filter and the suggestion
+        # aggregator actually use (see typesense_client.py's schema comment).
+        "languages_filter":       [l.get("name") for l in (row.get("languages") or [])
                                    if isinstance(l, dict) and l.get("name")],
         "last_active_date":       str(row.get("last_active_date")) if row.get("last_active_date") else None,
         "contact_personal_email": bool((row.get("contact_availability") or {}).get("personal_email")),

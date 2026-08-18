@@ -427,6 +427,44 @@ async def test_empty_filters_no_scan_regression(patch_ts_search):
     assert result["count_capped"] is False
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  search_api.py — new enterprise filter-dimension clauses
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_enterprise_filter_clauses_render_correctly():
+    f = {
+        "industries": ["IT Services"], "jobFunctions": ["Engineering"],
+        "functionalAreas": ["Engineering - Software & QA"],
+        "companyIndustries": ["IT Services & Consulting"],
+        "seniorities": ["senior", "lead"], "languages": ["English"],
+    }
+    result = search_api._build_other_hard_filters(f)
+    assert "industry:=[`IT Services`]" in result
+    assert "job_function:=[`Engineering`]" in result
+    assert "functional_area:=[`Engineering - Software & QA`]" in result
+    assert "company_industry:=[`IT Services & Consulting`]" in result
+    assert "seniority:=[`senior`,`lead`]" in result
+    # Filters against the new languages_filter field, not the existing
+    # (production, unchanged, retrieve-only) languages field.
+    assert "languages_filter:=[`English`]" in result
+
+
+def test_future_analytics_fields_have_no_filter_clause():
+    """gender/age_years/marital_status/disability/desired_job_type/
+    employment_status_pref/work_auth_countries are indexed but must not be
+    filterable from the UI in this pass."""
+    f = {
+        "gender": ["Male"], "maritalStatus": ["Married"], "disability": ["No"],
+        "desiredJobType": ["Permanent"], "employmentStatusPref": ["Full time"],
+        "workAuthCountries": ["India"],
+    }
+    assert search_api._build_other_hard_filters(f) == ""
+
+
+def test_empty_enterprise_filters_produce_no_clauses():
+    assert search_api._build_other_hard_filters({}) == ""
+
+
 async def test_malformed_keyword_returns_400():
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc_info:
