@@ -465,6 +465,79 @@ def test_empty_enterprise_filters_produce_no_clauses():
     assert search_api._build_other_hard_filters({}) == ""
 
 
+# ── Past title/employer + field-of-study: clauses that were missing entirely.
+# Before these existed, the frontend sent previousTitle/previousEmployer/major
+# and the backend built NO clause, so setting one returned the whole
+# collection rather than narrowing it.
+
+def test_previous_title_filters_on_all_titles():
+    result = search_api._build_other_hard_filters({"previousTitle": ["Software Engineer"]})
+    assert result == "all_titles:=[`Software Engineer`]"
+
+
+def test_previous_employer_filters_on_all_employers():
+    result = search_api._build_other_hard_filters({"previousEmployer": ["Infosys", "TCS"]})
+    assert result == "all_employers:=[`Infosys`,`TCS`]"
+
+
+def test_major_filters_on_fields_of_study():
+    result = search_api._build_other_hard_filters({"major": ["Computer Science"]})
+    assert result == "fields_of_study:=[`Computer Science`]"
+
+
+def test_previous_and_current_title_are_independent_clauses():
+    """Current title filters `title`, previous filters `all_titles` — both
+    present means both clauses, ANDed."""
+    result = search_api._build_other_hard_filters({
+        "titles": ["Senior Engineer"], "previousTitle": ["Junior Engineer"],
+    })
+    assert "title:=[`Senior Engineer`]" in result
+    assert "all_titles:=[`Junior Engineer`]" in result
+
+
+# ── Experience: numeric min/max overrides the bucket ──────────────────────
+
+def test_years_bucket_still_works_unchanged():
+    result = search_api._build_other_hard_filters({"yearsExperience": "3_5"})
+    assert result == "total_experience_months:>=36 && total_experience_months:<=60"
+
+
+def test_years_min_max_override_bucket():
+    result = search_api._build_other_hard_filters({
+        "yearsExperience": "3_5", "yearsMin": 7, "yearsMax": 12,
+    })
+    assert result == "total_experience_months:>=84 && total_experience_months:<=144"
+
+
+def test_years_min_only():
+    result = search_api._build_other_hard_filters({"yearsMin": 3})
+    assert result == "total_experience_months:>=36"
+
+
+def test_years_max_only():
+    result = search_api._build_other_hard_filters({"yearsMax": 8})
+    assert result == "total_experience_months:<=96"
+
+
+def test_years_min_max_accepts_numeric_strings():
+    """The wire may carry them as strings depending on how the UI serializes."""
+    result = search_api._build_other_hard_filters({"yearsMin": "3", "yearsMax": "8"})
+    assert result == "total_experience_months:>=36 && total_experience_months:<=96"
+
+
+@pytest.mark.parametrize("bad", ["", None, "abc", "3.5.1", [], {}])
+def test_years_min_max_ignore_malformed_values_without_raising(bad):
+    """A malformed value must degrade to the bucket, never 500 the search."""
+    result = search_api._build_other_hard_filters({"yearsExperience": "3_5", "yearsMin": bad})
+    assert result == "total_experience_months:>=36 && total_experience_months:<=60"
+
+
+def test_years_zero_min_is_honoured_not_treated_as_empty():
+    """0 is a legitimate minimum and must not be swallowed by a falsy check."""
+    result = search_api._build_other_hard_filters({"yearsMin": 0, "yearsMax": 2})
+    assert result == "total_experience_months:>=0 && total_experience_months:<=24"
+
+
 async def test_malformed_keyword_returns_400():
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc_info:

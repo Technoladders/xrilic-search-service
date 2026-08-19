@@ -210,12 +210,29 @@ def _build_other_hard_filters(f: dict[str, Any]) -> str:
         else:
             parts.append(f"current_employer:=[{','.join(_escape(e) for e in employers)}]")
 
+    # Past title / past employer. The all_titles / all_employers array fields
+    # already hold every title/employer from the candidate's full history
+    # (current included), so these match "has held this title" / "has worked
+    # here" at any point. Previously these two keys were sent by the frontend
+    # but had no clause at all here, so setting either silently returned the
+    # entire collection.
+    if p := _filter_any("all_titles", f.get("previousTitle") or []):
+        parts.append(p)
+    if p := _filter_any("all_employers", f.get("previousEmployer") or []):
+        parts.append(p)
+
     if p := _filter_any("location", f.get("locations") or []):
         parts.append(p)
 
     if p := _filter_any("schools", f.get("school") or []):
         parts.append(p)
     if p := _filter_any("degrees", f.get("degree") or []):
+        parts.append(p)
+    # fields_of_study is already indexed and populated by transform_row(), and
+    # `field_of_study` is already a live /mc/search_suggestions dimension —
+    # this clause was the missing half. Frontend key is `major`, matching the
+    # name PremiumFilters already uses for the same concept.
+    if p := _filter_any("fields_of_study", f.get("major") or []):
         parts.append(p)
 
     # Enterprise filter dimensions (search-suggestions project) — same
@@ -241,7 +258,26 @@ def _build_other_hard_filters(f: dict[str, Any]) -> str:
     if p := _filter_any("languages_filter", f.get("languages") or []):
         parts.append(p)
 
+    # Experience: the bucket string is the historical input; an explicit
+    # numeric yearsMin/yearsMax pair (which the frontend has always sent but
+    # this function never read) overrides it, so an arbitrary range like
+    # 3-8 years is expressible. Non-numeric/empty values are ignored rather
+    # than raising, so a malformed value degrades to the bucket instead of
+    # 500-ing the whole search.
     y_min, y_max = _parse_years_bucket(f.get("yearsExperience"))
+    for _key, _set in (("yearsMin", "min"), ("yearsMax", "max")):
+        _raw = f.get(_key)
+        if _raw is None or _raw == "":
+            continue
+        try:
+            _val = int(_raw)
+        except (TypeError, ValueError):
+            continue
+        if _set == "min":
+            y_min = _val
+        else:
+            y_max = _val
+
     if y_min is not None:
         parts.append(f"total_experience_months:>={y_min*12}")
     if y_max is not None:
