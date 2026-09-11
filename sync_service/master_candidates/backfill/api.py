@@ -188,10 +188,18 @@ async def backfill_dry_run(request: Request, user_id: str = Depends(require_glob
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Stats -- estimated counts only, meant to be polled infrequently (see
-# worker.get_status for the cheap, frequent-poll-safe endpoint instead)
+# Stats -- exact counts. Deliberately NOT count=estimated: SUPABASE_REST here
+# resolves to a read replica, and a standby never runs its own ANALYZE (that
+# requires write access to pg_statistic), so pg_class.reltuples -- what
+# PostgREST's estimated count reads -- stays frozen at whatever the replica
+# inherited and never reflects real growth. Confirmed in production:
+# estimated total_source_rows read 2,916,706 against naukri_candidates' real
+# count of 2,788,835 -- a 128K-row error that showed up as a phantom
+# 84,716-row "still uningested" backlog on a backfill that had actually
+# already finished (see worker.get_status for the cheap, frequent-poll-safe
+# endpoint that doesn't need any of this).
 # ─────────────────────────────────────────────────────────────────────────────
-async def _get_count(client: httpx.AsyncClient, table: str, params: dict[str, str], estimated: bool = True) -> int:
+async def _get_count(client: httpx.AsyncClient, table: str, params: dict[str, str], estimated: bool = False) -> int:
     prefer = f"count={'estimated' if estimated else 'exact'}"
     r = await client.get(
         f"{SUPABASE_REST}/{table}",
@@ -215,11 +223,8 @@ async def backfill_stats(user_id: str = Depends(require_global_superadmin)) -> d
         total_master_candidates = await _get_count(client, "master_candidates", {})
         total_full_profile = await _get_count(client, "master_candidates", {"has_full_profile": "eq.true"})
         total_with_contact = await _get_count(client, "master_candidates", {"has_contact": "eq.true"})
-        # candidate_merge_queue only ever holds a small number of pending
-        # fuzzy-match pairs -- exact count is fine and stays cheap regardless
-        # of backfill scale.
         total_pending_merge_review = await _get_count(
-            client, "candidate_merge_queue", {"status": "eq.pending"}, estimated=False)
+            client, "candidate_merge_queue", {"status": "eq.pending"})
 
         latest_source_r = await client.get(
             f"{SUPABASE_REST}/candidate_source_links",
