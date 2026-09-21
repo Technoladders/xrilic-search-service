@@ -53,7 +53,7 @@ from typing import Any, Optional
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 
-from ..config import (
+from .config import (
     SB_HEADERS, SUPABASE_REST, SUPABASE_URL, HTTP_TIMEOUT_SUPABASE,
     TYPESENSE_BASE, TS_HEADERS, TS_COLLECTION, HTTP_TIMEOUT_TYPESENSE,
 )
