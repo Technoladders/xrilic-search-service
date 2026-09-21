@@ -38,6 +38,7 @@ from master_candidates import (
     suggestions_api as mc_suggestions,
     admin_api as mc_admin,
     ingest as mc_ingest,
+    analytics_api as mc_analytics,
 )
 from master_candidates.backfill import api as mc_backfill_api
 from master_candidates.backfill import worker as mc_backfill_worker
@@ -181,6 +182,7 @@ app.include_router(mc_search.router)
 app.include_router(mc_suggestions.router)
 app.include_router(mc_admin.router)
 app.include_router(mc_backfill_api.router)
+app.include_router(mc_analytics.router)
 
 
 @app.get("/health")

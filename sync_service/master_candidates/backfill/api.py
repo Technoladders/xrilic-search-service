@@ -198,21 +198,49 @@ async def backfill_dry_run(request: Request, user_id: str = Depends(require_glob
 # 84,716-row "still uningested" backlog on a backfill that had actually
 # already finished (see worker.get_status for the cheap, frequent-poll-safe
 # endpoint that doesn't need any of this).
+#
+# count=exact has no shortcut on Postgres -- it must visit every matching row
+# for MVCC visibility -- so an unfiltered count over a ~2.79M-row table (or a
+# filtered count whose filter still matches nearly the whole table, e.g.
+# candidate_source_links' single-source portal_a rows) can legitimately take
+# longer than the shared HTTP_TIMEOUT_SUPABASE=30s used everywhere else in
+# this service. Confirmed in production: total_source_rows alone raised
+# httpx.ReadTimeout, which (being unhandled) surfaced to the browser as a
+# CORS error -- FastAPI's default 500 for an unhandled exception is built by
+# Starlette's ServerErrorMiddleware, which sits OUTSIDE CORSMiddleware, so it
+# never gets an Access-Control-Allow-Origin header; "blocked by CORS policy"
+# was a red herring for the real failure, the timeout. Given its own longer
+# timeout here (STATS_COUNT_TIMEOUT_SEC) rather than raising the shared
+# HTTP_TIMEOUT_SUPABASE constant, which would also loosen unrelated,
+# latency-sensitive call sites (auth checks, ingest, search). And made
+# resilient to a per-count failure: a table this size can occasionally still
+# exceed even this longer timeout under load, and the correct response to
+# "couldn't get an exact count in time" is null ("unavailable"), never a
+# silent 0 or a crash of the other five counts in the same response --
+# returning 0 would reintroduce exactly the kind of wrong-but-confident
+# number this endpoint was fixed to stop showing.
 # ─────────────────────────────────────────────────────────────────────────────
-async def _get_count(client: httpx.AsyncClient, table: str, params: dict[str, str], estimated: bool = False) -> int:
+STATS_COUNT_TIMEOUT_SEC = 60.0
+
+
+async def _get_count(client: httpx.AsyncClient, table: str, params: dict[str, str], estimated: bool = False) -> Optional[int]:
     prefer = f"count={'estimated' if estimated else 'exact'}"
-    r = await client.get(
-        f"{SUPABASE_REST}/{table}",
-        params={**params, "select": "id", "limit": "1"},
-        headers={**SB_HEADERS, "Prefer": prefer},
-        timeout=HTTP_TIMEOUT_SUPABASE)
-    r.raise_for_status()
+    try:
+        r = await client.get(
+            f"{SUPABASE_REST}/{table}",
+            params={**params, "select": "id", "limit": "1"},
+            headers={**SB_HEADERS, "Prefer": prefer},
+            timeout=STATS_COUNT_TIMEOUT_SEC)
+        r.raise_for_status()
+    except httpx.HTTPError as e:
+        logger.warning(f"[mc-backfill-stats] count failed for {table} {params}: {e!r}")
+        return None
     content_range = r.headers.get("content-range", "")
     total = content_range.rsplit("/", 1)[-1] if "/" in content_range else ""
     try:
         return int(total)
     except ValueError:
-        return 0
+        return None
 
 
 @router.get("/stats")
@@ -243,10 +271,16 @@ async def backfill_stats(user_id: str = Depends(require_global_superadmin)) -> d
         latest_master_rows = latest_master_r.json()
         latest_master_updated_at = latest_master_rows[0].get("updated_at") if latest_master_rows else None
 
+    total_uningested = (
+        max(0, total_source_rows - total_ingested)
+        if total_source_rows is not None and total_ingested is not None
+        else None
+    )
+
     return {
         "total_source_rows": total_source_rows,
         "total_ingested": total_ingested,
-        "total_uningested": max(0, total_source_rows - total_ingested),
+        "total_uningested": total_uningested,
         "total_master_candidates": total_master_candidates,
         "total_full_profile": total_full_profile,
         "total_with_contact": total_with_contact,
