@@ -387,3 +387,70 @@ async def get_full_distributions(
         raise HTTPException(status_code=502, detail="typesense full_distributions query failed")
 
     return {"distributions": out}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /pg_snapshot/rebuild -- orchestrates the Postgres-only analytics (trend,
+# expected CTC, contact-method breakdown, completeness, notice period --
+# the handful of things genuinely absent from the Typesense index, see the
+# module docstring). request_master_candidates_analytics_refresh() (the
+# monolithic version, still used by the sibling MasterCandidatesAnalyticsPage)
+# kept hitting 57014 statement timeout when PostgREST ran it synchronously
+# for the browser -- SET LOCAL statement_timeout didn't reliably fix it in
+# production. Rather than keep tuning against a timeout ceiling this service
+# doesn't control, this calls 4 SPLIT, individually-cheap SQL functions
+# (mc_analytics_group_totals/numeric/quality/trend -- each just 2-5
+# single-pass full-table scans, not ~14 run sequentially) in parallel, each
+# with its own generous httpx timeout this service DOES control, merges the
+# results here, and writes the snapshot with one trivial insert. Same fix
+# shape already proven for full_distributions/rebuild: move orchestration
+# of anything that touches the full 2.8M-row table out of a single
+# browser-triggered PostgREST call and into this backend.
+# ─────────────────────────────────────────────────────────────────────────────
+PG_SNAPSHOT_GROUP_FNS = [
+    "mc_analytics_group_totals", "mc_analytics_group_numeric",
+    "mc_analytics_group_quality", "mc_analytics_group_trend",
+]
+PG_SNAPSHOT_HTTP_TIMEOUT = httpx.Timeout(120.0, connect=30.0)  # generous headroom; each call is expected to take low single-digit seconds
+PG_SNAPSHOT_COOLDOWN_SEC = 600
+
+_last_pg_snapshot_at: Optional[float] = None
+
+
+async def _call_pg_group_fn(client: httpx.AsyncClient, fn_name: str) -> dict[str, Any]:
+    r = await client.post(
+        f"{SUPABASE_REST}/rpc/{fn_name}", headers=SB_HEADERS, json={},
+        timeout=PG_SNAPSHOT_HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r.json() or {}
+
+
+@router.post("/pg_snapshot/rebuild")
+async def rebuild_pg_snapshot(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
+    global _last_pg_snapshot_at
+    now = time.monotonic()
+    if _last_pg_snapshot_at is not None and (now - _last_pg_snapshot_at) < PG_SNAPSHOT_COOLDOWN_SEC:
+        return {"skipped": True, "reason": f"refreshed within the last {PG_SNAPSHOT_COOLDOWN_SEC}s"}
+
+    start = time.monotonic()
+    try:
+        async with httpx.AsyncClient() as client:
+            group_results = await asyncio.gather(
+                *(_call_pg_group_fn(client, fn) for fn in PG_SNAPSHOT_GROUP_FNS))
+            payload: dict[str, Any] = {}
+            for group in group_results:
+                payload.update(group)
+
+            duration_ms = int((time.monotonic() - start) * 1000)
+            write_r = await client.post(
+                f"{SUPABASE_REST}/rpc/mc_analytics_write_snapshot", headers=SB_HEADERS,
+                json={"p_payload": payload, "p_duration_ms": duration_ms},
+                timeout=PG_SNAPSHOT_HTTP_TIMEOUT)
+            write_r.raise_for_status()
+    except httpx.HTTPError as e:
+        logger.warning(f"[mc-analytics] pg_snapshot rebuild failed: {e!r}")
+        raise HTTPException(status_code=502, detail=f"pg_snapshot rebuild failed: {e}")
+
+    _last_pg_snapshot_at = now
+    logger.info(f"[mc-analytics] pg_snapshot rebuild: duration_ms={duration_ms} keys={list(payload.keys())}")
+    return {"skipped": False, "duration_ms": duration_ms}
