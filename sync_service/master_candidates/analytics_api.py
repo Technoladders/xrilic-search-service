@@ -158,10 +158,15 @@ EXP_BUCKETS_MONTHS = [
     ("Fresher", None, 12), ("1-3 yrs", 12, 36), ("3-5 yrs", 36, 60),
     ("5-10 yrs", 60, 120), ("10+ yrs", 120, None),
 ]
-NOTICE_BUCKETS_DAYS = [
-    ("Immediate", None, 1), ("1-15 days", 1, 15), ("16-30 days", 15, 30),
-    ("31-60 days", 30, 60), ("60+ days", 60, None),
-]
+# No NOTICE_BUCKETS_DAYS -- deliberately removed. notice_period_days is NULL
+# for all but 1 of 2,837,322 master_candidates rows (confirmed via direct
+# Postgres query), so any bucketing of it is meaningless by construction;
+# indexer.py:188's `row.get("notice_period_days") or 0` then bakes every one
+# of those nulls into a fake Typesense 0, which was showing up here as a
+# near-total "Immediate" spike that reflected nothing real. The actual
+# signal lives in the free-text notice_period_display column instead (e.g.
+# "1 Month", "15 Days or less") -- see get_master_candidates_analytics()'s
+# notice_period_dist in the Postgres snapshot, which the frontend uses.
 
 
 def _range_filter(field: str, lo: Optional[float], hi: Optional[float]) -> str:
@@ -203,16 +208,15 @@ async def _multi_search_counts(
 async def get_numeric_buckets(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient() as client:
-            ctc, exp, notice = await asyncio.gather(
+            ctc, exp = await asyncio.gather(
                 _multi_search_counts(client, "current_ctc_lacs", CTC_BUCKETS),
                 _multi_search_counts(client, "total_experience_months", EXP_BUCKETS_MONTHS),
-                _multi_search_counts(client, "notice_period_days", NOTICE_BUCKETS_DAYS),
             )
     except httpx.HTTPError as e:
         logger.warning(f"[mc-analytics] numeric_buckets query failed: {e!r}")
         raise HTTPException(status_code=502, detail="typesense numeric bucket query failed")
 
-    return {"ctc_buckets": ctc, "experience_buckets": exp, "notice_period_buckets": notice}
+    return {"ctc_buckets": ctc, "experience_buckets": exp}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,6 +276,18 @@ async def _upsert_full_analytics_batch(client: httpx.AsyncClient, docs: list[dic
 _last_rebuild_at: Optional[float] = None  # module-level, single-process app (see main.py's uvicorn CMD)
 
 
+# httpx.AsyncClient()'s own default timeout is ~5s -- far too short for
+# streaming+aggregating ~2.8M documents. suggestions_aggregator.py's own
+# docstring says a comparable full-collection pass takes 5-15 minutes at
+# 1.5M rows; confirmed in production that the export's response headers
+# logged 200 OK (client.stream() returns as soon as headers arrive, before
+# the body is read) and then nothing further -- no upsert calls, no
+# completion log -- consistent with a ReadTimeout killing the stream
+# mid-read. Generous enough for a considerably larger collection than what
+# was actually observed to time out.
+REBUILD_HTTP_TIMEOUT = httpx.Timeout(1800.0, connect=30.0)
+
+
 @router.post("/full_distributions/rebuild")
 async def rebuild_full_distributions(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
     global _last_rebuild_at
@@ -279,23 +295,34 @@ async def rebuild_full_distributions(user_id: str = Depends(require_global_super
     if _last_rebuild_at is not None and (now - _last_rebuild_at) < REBUILD_COOLDOWN_SEC:
         return {"skipped": True, "reason": f"rebuilt within the last {REBUILD_COOLDOWN_SEC}s"}
 
-    async with httpx.AsyncClient() as client:
-        await _ensure_full_analytics_collection(client)
-        # Reuses suggestions_aggregator.py's export+aggregate logic UNCHANGED
-        # -- proven correct against the real field shapes already, just with
-        # a much higher cap and written to our own separate collection.
-        report = await sagg.run_aggregation(
-            sagg.export_documents(client), cap_per_dimension=FULL_DISTRIBUTIONS_CAP_PER_DIMENSION)
-        rows = [
-            {"id": r["id"], "type": r["type"], "value": r["value"], "candidate_count": r["candidate_count"]}
-            for r in report.rows
-        ]
-        inserted, errors = 0, []
-        batch_size = 500
-        for i in range(0, len(rows), batch_size):
-            ok, errs = await _upsert_full_analytics_batch(client, rows[i:i + batch_size])
-            inserted += ok
-            errors.extend(errs)
+    try:
+        async with httpx.AsyncClient(timeout=REBUILD_HTTP_TIMEOUT) as client:
+            await _ensure_full_analytics_collection(client)
+            # Reuses suggestions_aggregator.py's export+aggregate logic
+            # UNCHANGED -- proven correct against the real field shapes
+            # already, just with a much higher cap and written to our own
+            # separate collection.
+            report = await sagg.run_aggregation(
+                sagg.export_documents(client), cap_per_dimension=FULL_DISTRIBUTIONS_CAP_PER_DIMENSION)
+            rows = [
+                {"id": r["id"], "type": r["type"], "value": r["value"], "candidate_count": r["candidate_count"]}
+                for r in report.rows
+            ]
+            inserted, errors = 0, []
+            batch_size = 500
+            for i in range(0, len(rows), batch_size):
+                ok, errs = await _upsert_full_analytics_batch(client, rows[i:i + batch_size])
+                inserted += ok
+                errors.extend(errs)
+    except httpx.HTTPError as e:
+        # Never let this escape unhandled -- an uncaught exception here
+        # produces a 500 that Starlette's ServerErrorMiddleware builds
+        # OUTSIDE CORSMiddleware, so it reaches the browser with no
+        # Access-Control-Allow-Origin header and looks like a silent/CORS
+        # failure instead of a real error message (same mechanism already
+        # found and fixed once in backfill/api.py).
+        logger.warning(f"[mc-analytics] full_distributions rebuild failed: {e!r}")
+        raise HTTPException(status_code=502, detail=f"rebuild failed: {e}")
 
     _last_rebuild_at = now
     logger.info(
