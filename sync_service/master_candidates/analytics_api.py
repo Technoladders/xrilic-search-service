@@ -165,11 +165,17 @@ NOTICE_BUCKETS_DAYS = [
 
 
 def _range_filter(field: str, lo: Optional[float], hi: Optional[float]) -> str:
+    # Half-open [lo, hi) via two explicit conditions -- NOT Typesense's
+    # `[lo..hi]` bracket syntax, which is inclusive on BOTH ends and was
+    # double-counting every document sitting exactly on a shared boundary
+    # (e.g. exactly 20 lacs counted in both "12-20 L" and "20-35 L") --
+    # confirmed in production: experience bucket counts summed to 3,080,487
+    # against a true total of 2,786,500.
     if lo is None:
         return f"{field}:<{hi}"
     if hi is None:
         return f"{field}:>={lo}"
-    return f"{field}:[{lo}..{hi}]"
+    return f"{field}:>={lo} && {field}:<{hi}"
 
 
 async def _multi_search_counts(
