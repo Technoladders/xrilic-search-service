@@ -19,7 +19,10 @@ backfill_errors_superadmin_all RLS policy / set_mc_process_control RPC,
 both of which already use e.user_id = auth.uid().
 """
 
+import asyncio
 import logging
+import os
+import time
 from typing import Any, Optional
 
 import httpx
@@ -243,8 +246,58 @@ async def _get_count(client: httpx.AsyncClient, table: str, params: dict[str, st
         return None
 
 
+# The six counts above cost ~4 minutes of database execution time per call in
+# production (exact counts over ~2.8M-row tables), and the superadmin page
+# polls this endpoint every 45 s with no in-flight guard, so slow responses
+# stacked up: ~2,000 min of DB time in 12.6 days. The numbers move slowly, so
+# serve one computed result for STATS_CACHE_TTL_SEC, and let concurrent
+# requests share a single in-progress computation instead of each starting
+# their own. Counts stay exact; only their freshness is bounded.
+STATS_CACHE_TTL_SEC = float(os.getenv("MC_BACKFILL_STATS_CACHE_TTL_SEC", "600"))
+# ?refresh=true (the page's manual Refresh) bypasses the TTL, but never more
+# often than this, so a repeatedly clicked button can't bring the load back.
+STATS_MIN_REFRESH_SEC = float(os.getenv("MC_BACKFILL_STATS_MIN_REFRESH_SEC", "60"))
+
+_stats_lock = asyncio.Lock()
+_stats_cache: dict[str, Any] = {"at": None, "data": None}
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
 @router.get("/stats")
-async def backfill_stats(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
+async def backfill_stats(refresh: bool = False,
+                         user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
+    max_age = STATS_MIN_REFRESH_SEC if refresh else STATS_CACHE_TTL_SEC
+    cached = _fresh_stats(max_age)
+    if cached is not None:
+        return cached
+    async with _stats_lock:
+        cached = _fresh_stats(max_age)   # filled by a request we waited behind
+        if cached is not None:
+            return cached
+        data = {**await _compute_stats(), "computed_at": time.time()}
+        # A count that timed out comes back as None ("unavailable"); don't pin
+        # that for the whole TTL — the next poll retries.
+        if all(data[k] is not None for k in _STATS_COUNT_KEYS):
+            _stats_cache["at"] = _monotonic()
+            _stats_cache["data"] = data
+        return {**data, "cached": False}
+
+
+_STATS_COUNT_KEYS = ("total_source_rows", "total_ingested", "total_master_candidates",
+                     "total_full_profile", "total_with_contact", "total_pending_merge_review")
+
+
+def _fresh_stats(max_age: float) -> Optional[dict[str, Any]]:
+    at = _stats_cache["at"]
+    if at is None or _monotonic() - at >= max_age:
+        return None
+    return {**_stats_cache["data"], "cached": True}
+
+
+async def _compute_stats() -> dict[str, Any]:
     async with httpx.AsyncClient() as client:
         total_source_rows = await _get_count(client, "naukri_candidates", {})
         total_ingested = await _get_count(client, "candidate_source_links", {"source": f"eq.{SOURCE}"})
