@@ -27,6 +27,7 @@ from .indexer import index_ids
 from .typesense_client import sync_synonyms, ensure_fields, ensure_suggestions_collection
 from .ingest import WEBHOOK_QUEUE
 from .suggestions_aggregator import rebuild_suggestions
+from .shared_writes import require_shared_writes
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mc", tags=["master_candidates_admin"])
@@ -66,7 +67,7 @@ async def admin_status(token: str = Depends(require_admin)) -> dict[str, Any]:
 
 
 # ── Admin: set control state ───────────────────────────────────────────────
-@router.post("/admin/control")
+@router.post("/admin/control", dependencies=[Depends(require_shared_writes)])
 async def admin_control(request: Request, token: str = Depends(require_admin)) -> dict[str, Any]:
     payload = await request.json()
     process = payload.get("process")

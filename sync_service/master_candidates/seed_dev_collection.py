@@ -80,15 +80,28 @@ NEW_FIELDS_TO_REPORT = [
 ]
 
 
+FETCH_PAGE_SIZE = 1000  # PostgREST's max-rows cap; a single larger GET is silently truncated
+
+
 async def fetch_sample(client: httpx.AsyncClient, limit: int) -> list[dict]:
-    r = await client.get(
-        f"{SUPABASE_REST}/master_candidates",
-        headers=SB_HEADERS,
-        params={"select": SELECT_COLUMNS, "order": "updated_at.desc", "limit": str(limit)},
-        timeout=HTTP_TIMEOUT_SUPABASE,
-    )
-    r.raise_for_status()
-    return r.json()
+    rows: list[dict] = []
+    while len(rows) < limit:
+        page_size = min(FETCH_PAGE_SIZE, limit - len(rows))
+        r = await client.get(
+            f"{SUPABASE_REST}/master_candidates",
+            headers=SB_HEADERS,
+            params={"select": SELECT_COLUMNS, "order": "updated_at.desc,id.desc",
+                    "limit": str(page_size), "offset": str(len(rows))},
+            timeout=HTTP_TIMEOUT_SUPABASE,
+        )
+        r.raise_for_status()
+        page = r.json()
+        rows.extend(page)
+        if len(rows) % 10000 < page_size:
+            print(f"   ...{len(rows)} rows")
+        if len(page) < page_size:
+            break
+    return rows
 
 
 async def main() -> None:

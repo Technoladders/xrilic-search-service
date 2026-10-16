@@ -58,6 +58,7 @@ from .config import (
     TYPESENSE_BASE, TS_HEADERS, TS_COLLECTION, HTTP_TIMEOUT_TYPESENSE,
 )
 from . import suggestions_aggregator as sagg
+from .shared_writes import require_shared_writes
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/mc/admin/analytics", tags=["master_candidates_full_analytics"])
@@ -154,6 +155,12 @@ CTC_BUCKETS = [
     ("<2 L", None, 2), ("2-5 L", 2, 5), ("5-8 L", 5, 8), ("8-12 L", 8, 12),
     ("12-20 L", 12, 20), ("20-35 L", 20, 35), ("35+ L", 35, None),
 ]
+# expected_ctc_lacs IS indexed in Typesense (index:true, float, sortable) --
+# confirmed directly against the live collection schema. Earlier claimed
+# absent based on an incomplete source-code summary; that was wrong, and
+# this corrects it -- same bucket shape as current_ctc_lacs, no reason for
+# this one to go through the Postgres snapshot at all.
+EXPECTED_CTC_BUCKETS = CTC_BUCKETS
 EXP_BUCKETS_MONTHS = [
     ("Fresher", None, 12), ("1-3 yrs", 12, 36), ("3-5 yrs", 36, 60),
     ("5-10 yrs", 60, 120), ("10+ yrs", 120, None),
@@ -208,15 +215,16 @@ async def _multi_search_counts(
 async def get_numeric_buckets(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
     try:
         async with httpx.AsyncClient() as client:
-            ctc, exp = await asyncio.gather(
+            ctc, ectc, exp = await asyncio.gather(
                 _multi_search_counts(client, "current_ctc_lacs", CTC_BUCKETS),
+                _multi_search_counts(client, "expected_ctc_lacs", EXPECTED_CTC_BUCKETS),
                 _multi_search_counts(client, "total_experience_months", EXP_BUCKETS_MONTHS),
             )
     except httpx.HTTPError as e:
         logger.warning(f"[mc-analytics] numeric_buckets query failed: {e!r}")
         raise HTTPException(status_code=502, detail="typesense numeric bucket query failed")
 
-    return {"ctc_buckets": ctc, "experience_buckets": exp}
+    return {"ctc_buckets": ctc, "expected_ctc_buckets": ectc, "experience_buckets": exp}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,26 +283,31 @@ async def _upsert_full_analytics_batch(client: httpx.AsyncClient, docs: list[dic
 
 _last_rebuild_at: Optional[float] = None  # module-level, single-process app (see main.py's uvicorn CMD)
 
+# Fire-and-forget background task state -- NOT a request/response value.
+# Both the Postgres RPC path (57014, PostgREST's statement_timeout) and this
+# Typesense path (504, confirmed in production against an intermediate
+# reverse proxy -- Nginx Proxy Manager in front of sync.xrilic.ai) failed
+# for the same underlying reason: a multi-minute job was run synchronously
+# inside a single held-open HTTP request, and something between the browser
+# and this service killed that connection before the work finished. No
+# timeout tuning fixes that -- the fix is to never hold the request open
+# that long in the first place. This mirrors the exact pattern already
+# proven at this scale by the portal_a backfill worker
+# (backfill/worker.py's asyncio.create_task + a separate /status poll):
+# POST returns instantly once the task is scheduled; the frontend polls
+# GET .../rebuild/status for progress.
+_full_dist_task: Optional[asyncio.Task] = None
+_full_dist_status: dict[str, Any] = {"state": "idle", "started_at": None, "finished_at": None, "error": None, "result": None}
 
 # httpx.AsyncClient()'s own default timeout is ~5s -- far too short for
-# streaming+aggregating ~2.8M documents. suggestions_aggregator.py's own
-# docstring says a comparable full-collection pass takes 5-15 minutes at
-# 1.5M rows; confirmed in production that the export's response headers
-# logged 200 OK (client.stream() returns as soon as headers arrive, before
-# the body is read) and then nothing further -- no upsert calls, no
-# completion log -- consistent with a ReadTimeout killing the stream
-# mid-read. Generous enough for a considerably larger collection than what
-# was actually observed to time out.
+# streaming+aggregating ~2.8M documents. Now moot for proxy purposes (the
+# HTTP response returns immediately -- see above) but still needed for the
+# background task's own internal calls to Typesense, which do take real time.
 REBUILD_HTTP_TIMEOUT = httpx.Timeout(1800.0, connect=30.0)
 
 
-@router.post("/full_distributions/rebuild")
-async def rebuild_full_distributions(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
+async def _run_full_distributions_rebuild() -> None:
     global _last_rebuild_at
-    now = time.monotonic()
-    if _last_rebuild_at is not None and (now - _last_rebuild_at) < REBUILD_COOLDOWN_SEC:
-        return {"skipped": True, "reason": f"rebuilt within the last {REBUILD_COOLDOWN_SEC}s"}
-
     try:
         async with httpx.AsyncClient(timeout=REBUILD_HTTP_TIMEOUT) as client:
             await _ensure_full_analytics_collection(client)
@@ -314,27 +327,39 @@ async def rebuild_full_distributions(user_id: str = Depends(require_global_super
                 ok, errs = await _upsert_full_analytics_batch(client, rows[i:i + batch_size])
                 inserted += ok
                 errors.extend(errs)
-    except httpx.HTTPError as e:
-        # Never let this escape unhandled -- an uncaught exception here
-        # produces a 500 that Starlette's ServerErrorMiddleware builds
-        # OUTSIDE CORSMiddleware, so it reaches the browser with no
-        # Access-Control-Allow-Origin header and looks like a silent/CORS
-        # failure instead of a real error message (same mechanism already
-        # found and fixed once in backfill/api.py).
+    except Exception as e:
         logger.warning(f"[mc-analytics] full_distributions rebuild failed: {e!r}")
-        raise HTTPException(status_code=502, detail=f"rebuild failed: {e}")
+        _full_dist_status.update(state="failed", finished_at=time.time(), error=str(e))
+        return
 
-    _last_rebuild_at = now
-    logger.info(
-        f"[mc-analytics] full_distributions rebuild: processed={report.documents_processed} "
-        f"rows={len(rows)} inserted={inserted} errors={len(errors)}")
-    return {
-        "skipped": False,
+    _last_rebuild_at = time.monotonic()
+    result = {
         "documents_processed": report.documents_processed,
         "rows_written": inserted,
         "errors": len(errors),
         "per_dimension_distinct_counts": report.per_dimension_distinct_counts,
     }
+    logger.info(f"[mc-analytics] full_distributions rebuild: {result}")
+    _full_dist_status.update(state="completed", finished_at=time.time(), error=None, result=result)
+
+
+@router.post("/full_distributions/rebuild")
+async def rebuild_full_distributions(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
+    global _full_dist_task
+    now = time.monotonic()
+    if _last_rebuild_at is not None and (now - _last_rebuild_at) < REBUILD_COOLDOWN_SEC:
+        return {"skipped": True, "started": False, "reason": f"rebuilt within the last {REBUILD_COOLDOWN_SEC}s"}
+    if _full_dist_task is not None and not _full_dist_task.done():
+        return {"skipped": True, "started": False, "reason": "a rebuild is already running"}
+
+    _full_dist_status.update(state="running", started_at=time.time(), finished_at=None, error=None, result=None)
+    _full_dist_task = asyncio.create_task(_run_full_distributions_rebuild())
+    return {"skipped": False, "started": True}
+
+
+@router.get("/full_distributions/rebuild/status")
+async def get_full_distributions_rebuild_status(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
+    return _full_dist_status
 
 
 TYPESENSE_MAX_PER_PAGE = 250  # Typesense's own hard cap on /documents/search -- higher values error out
@@ -416,6 +441,14 @@ PG_SNAPSHOT_COOLDOWN_SEC = 600
 
 _last_pg_snapshot_at: Optional[float] = None
 
+# Same fire-and-forget shape as full_distributions above -- the direct
+# supabase.rpc() call this replaced hit 504/57014 the same way, confirming
+# it's not really about Postgres specifically: any multi-second-plus job run
+# synchronously inside one HTTP request is at the mercy of whatever timeout
+# the browser, Nginx, or PostgREST enforces on that single connection.
+_pg_snapshot_task: Optional[asyncio.Task] = None
+_pg_snapshot_status: dict[str, Any] = {"state": "idle", "started_at": None, "finished_at": None, "error": None, "result": None}
+
 
 async def _call_pg_group_fn(client: httpx.AsyncClient, fn_name: str) -> dict[str, Any]:
     r = await client.post(
@@ -425,13 +458,8 @@ async def _call_pg_group_fn(client: httpx.AsyncClient, fn_name: str) -> dict[str
     return r.json() or {}
 
 
-@router.post("/pg_snapshot/rebuild")
-async def rebuild_pg_snapshot(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
+async def _run_pg_snapshot_rebuild() -> None:
     global _last_pg_snapshot_at
-    now = time.monotonic()
-    if _last_pg_snapshot_at is not None and (now - _last_pg_snapshot_at) < PG_SNAPSHOT_COOLDOWN_SEC:
-        return {"skipped": True, "reason": f"refreshed within the last {PG_SNAPSHOT_COOLDOWN_SEC}s"}
-
     start = time.monotonic()
     try:
         async with httpx.AsyncClient() as client:
@@ -447,10 +475,32 @@ async def rebuild_pg_snapshot(user_id: str = Depends(require_global_superadmin))
                 json={"p_payload": payload, "p_duration_ms": duration_ms},
                 timeout=PG_SNAPSHOT_HTTP_TIMEOUT)
             write_r.raise_for_status()
-    except httpx.HTTPError as e:
+    except Exception as e:
         logger.warning(f"[mc-analytics] pg_snapshot rebuild failed: {e!r}")
-        raise HTTPException(status_code=502, detail=f"pg_snapshot rebuild failed: {e}")
+        _pg_snapshot_status.update(state="failed", finished_at=time.time(), error=str(e))
+        return
 
-    _last_pg_snapshot_at = now
+    _last_pg_snapshot_at = time.monotonic()
     logger.info(f"[mc-analytics] pg_snapshot rebuild: duration_ms={duration_ms} keys={list(payload.keys())}")
-    return {"skipped": False, "duration_ms": duration_ms}
+    _pg_snapshot_status.update(
+        state="completed", finished_at=time.time(), error=None,
+        result={"duration_ms": duration_ms})
+
+
+@router.post("/pg_snapshot/rebuild", dependencies=[Depends(require_shared_writes)])
+async def rebuild_pg_snapshot(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
+    global _pg_snapshot_task
+    now = time.monotonic()
+    if _last_pg_snapshot_at is not None and (now - _last_pg_snapshot_at) < PG_SNAPSHOT_COOLDOWN_SEC:
+        return {"skipped": True, "started": False, "reason": f"refreshed within the last {PG_SNAPSHOT_COOLDOWN_SEC}s"}
+    if _pg_snapshot_task is not None and not _pg_snapshot_task.done():
+        return {"skipped": True, "started": False, "reason": "a refresh is already running"}
+
+    _pg_snapshot_status.update(state="running", started_at=time.time(), finished_at=None, error=None, result=None)
+    _pg_snapshot_task = asyncio.create_task(_run_pg_snapshot_rebuild())
+    return {"skipped": False, "started": True}
+
+
+@router.get("/pg_snapshot/rebuild/status")
+async def get_pg_snapshot_rebuild_status(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
+    return _pg_snapshot_status

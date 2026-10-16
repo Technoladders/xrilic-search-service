@@ -118,7 +118,15 @@ async def lifespan(app: FastAPI):
     mc_index_task = None
     mc_ingest_task = None
 
-    if mc_config.INDEX_ENABLED:
+    shared_writes = mc_config.SHARED_STATE_WRITES_ENABLED
+    if not shared_writes:
+        logger.warning(
+            f"[{mc_config.APP_ENV}] shared-state writers disabled "
+            "(SHARED_STATE_WRITES_ENABLED=false): no mc index loop, no mc "
+            "ingest loop, no backfill claim watchdog"
+        )
+
+    if mc_config.INDEX_ENABLED and shared_writes:
         mc_index_task = asyncio.create_task(
             mc_indexer.run_index_loop()
         )
@@ -126,7 +134,7 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("[mc] index loop DISABLED via MC_INDEX_ENABLED=false")
         
-    if mc_config.INGEST_ENABLED:
+    if mc_config.INGEST_ENABLED and shared_writes:
         mc_ingest_task = asyncio.create_task(
             mc_ingest.run_ingest_loop()
         )
@@ -143,8 +151,9 @@ async def lifespan(app: FastAPI):
     # boot check) so it keeps retrying the single-claimant claim rather
     # than giving up if another instance's heartbeat is still fresh.
     # ------------------------------------------------------------------
-    mc_backfill_worker.start_watchdog()
-    logger.info("[mc-backfill] claim watchdog started")
+    if shared_writes:
+        mc_backfill_worker.start_watchdog()
+        logger.info("[mc-backfill] claim watchdog started")
 
     # ------------------------------------------------------------------
 
