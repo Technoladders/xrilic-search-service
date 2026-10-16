@@ -90,8 +90,10 @@ jobs:
             echo "MC_BACKFILL_CONCURRENCY=20" >> .env
             echo "MC_BACKFILL_AUTO_RESUME=true" >> .env
 
-            echo "→ Restarting containers..."
-            docker compose up -d --force-recreate --remove-orphans
+            # API only: recreating typesense means a 20-40 min reload of the
+            # ~2M-doc index, so it is never touched by a code deploy.
+            echo "→ Recreating xrilic-search-service (typesense left running)..."
+            docker compose up -d --no-deps --force-recreate xrilic-search-service
 
             echo "→ Pruning old images..."
             docker image prune -f
