@@ -19,7 +19,15 @@ GET  /mc/avatar/{id} — streams the candidate's photo bytes from our own
                         one of the two search routes above.
 GET  /mc/health      — collection stats
 
-v5 CHANGE (this turn): moved Boolean query semantics into a testable
+v6 CHANGE (anti-scraping hardening — response shape and frontend data UNCHANGED):
+  • Cache-Control: no-store on /mc/search and /mc/search_v2 responses.
+  • user_id is logged on every search request (audit trail).
+  • /mc/health now requires authentication.
+  (Authentication via require_user and request-body validation via
+  _read_search_payload were already in place. profile_pic / the avatar URL
+  and /mc/avatar/{id} are deliberately left exactly as they were.)
+
+v5 CHANGE (carried from before): moved Boolean query semantics into a testable
 query-planning layer (./search/) and fixed two real bugs found there:
 
   1. NICE-skill inclusion was ANDed onto MUST/EXCLUDE (`skills:=must &&
@@ -501,21 +509,52 @@ def _to_rr_profile(hit: dict[str, Any], avatar_proxy: bool) -> dict[str, Any]:
     }
 
 
+
 async def require_user(authorization: str | None = Header(None)) -> str:
-    """Verify the Supabase JWT by calling the auth endpoint. Returns user id."""
+    """Verify the Supabase JWT and return the authenticated user ID."""
+
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing bearer token")
+        raise HTTPException(
+            status_code=401,
+            detail="missing bearer token",
+        )
+
     token = authorization[len("Bearer "):]
+
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{SUPABASE_URL}/auth/v1/user",
-            headers={"apikey": SB_HEADERS["apikey"],
-                     "Authorization": f"Bearer {token}"},
+            headers={
+                "apikey": SB_HEADERS["apikey"],
+                "Authorization": f"Bearer {token}",
+            },
             timeout=10.0,
         )
+
     if r.status_code != 200:
-        raise HTTPException(status_code=401, detail="invalid token")
-    return (r.json() or {}).get("id", "")
+        raise HTTPException(
+            status_code=401,
+            detail="invalid token",
+        )
+
+    try:
+        user_data = r.json()
+    except ValueError:
+        raise HTTPException(
+            status_code=401,
+            detail="invalid authentication response",
+        )
+
+    user_id = user_data.get("id") if isinstance(user_data, dict) else None
+
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise HTTPException(
+            status_code=401,
+            detail="authenticated user ID missing",
+        )
+
+    return user_id
+
 
 
 async def _ts_search(ts_params: dict[str, Any]) -> dict[str, Any]:
@@ -833,14 +872,66 @@ async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str,
     }
 
 
+async def _read_search_payload(request: Request) -> dict[str, Any]:
+    """Parse and validate a candidate-search request body."""
+
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(
+            status_code=400,
+            detail="Request body must contain valid JSON",
+        )
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Request body must be a JSON object",
+        )
+
+    filters = payload.get("filters")
+    if filters is not None and not isinstance(filters, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="'filters' must be a JSON object",
+        )
+
+    for field, default in (("page", 1), ("per_page", 25)):
+        value = payload.get(field, default)
+
+        # Reject booleans, floats, and other non-integer values.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{field}' must be an integer",
+            )
+
+        if value < 1:
+            raise HTTPException(
+                status_code=400,
+                detail=f"'{field}' must be greater than or equal to 1",
+            )
+
+    return payload
+
 @router.post("/search")
-async def search(request: Request, user_id: str = Depends(require_user)) -> dict[str, Any]:
-    payload = await request.json()
+async def search(
+    request: Request,
+    response: Response,
+    user_id: str = Depends(require_user),
+) -> dict[str, Any]:
+    response.headers["Cache-Control"] = "no-store"
+    logger.info(f"mc_search_request route=search user_id={user_id}")
+    payload = await _read_search_payload(request)
     return await _search_impl(payload, avatar_proxy=False)
 
 
 @router.post("/search_v2")
-async def search_v2(request: Request, user_id: str = Depends(require_user)) -> dict[str, Any]:
+async def search_v2(
+    request: Request,
+    response: Response,
+    user_id: str = Depends(require_user),
+) -> dict[str, Any]:
     """
     Identical filter/ranking/pagination behavior to /mc/search — both call
     _search_impl, so there is no duplicated search logic to drift out of sync.
@@ -848,7 +939,9 @@ async def search_v2(request: Request, user_id: str = Depends(require_user)) -> d
     inside _to_rr_profile: profile_pic becomes a same-origin proxy URL
     (/mc/avatar/<id>) instead of the raw third-party photo URL.
     """
-    payload = await request.json()
+    response.headers["Cache-Control"] = "no-store"
+    logger.info(f"mc_search_request route=search_v2 user_id={user_id}")
+    payload = await _read_search_payload(request)
     return await _search_impl(payload, avatar_proxy=True)
 
 
@@ -992,7 +1085,7 @@ async def avatar(candidate_id: str) -> Response:
 
 
 @router.get("/health")
-async def health() -> dict[str, Any]:
+async def health(user_id: str = Depends(require_user)) -> dict[str, Any]:
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{TYPESENSE_BASE}/collections/{TS_COLLECTION}",
