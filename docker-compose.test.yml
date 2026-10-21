@@ -1,0 +1,104 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# xrilic-search-service — TEST stack (branch: test)
+# Server path: /home/deploy/apps/xrilic-search-service-test/docker-compose.yml
+#   (deploy-test.yml copies this file there and renames it)
+#
+# Fully separate from production (docker-compose.yml), even though it runs on
+# the same server, the same Docker network and the same Supabase project:
+#   - own compose project name  → own volume, own --remove-orphans scope
+#   - own SERVICE names         → on the shared network Docker DNS resolves a
+#     service name to every container that carries it; reusing `typesense`
+#     here would let production's search service hit this test index
+#   - no host ports             → Nginx Proxy Manager reaches both containers
+#     by name over zivelogin-network-prod
+#       sync-test.xrilic.ai   → http://xrilic-search-service-test:8000
+#       search-test.xrilic.ai → http://typesense-test:8108
+#   - every loop that writes Supabase state production depends on is OFF
+#     (MC_* flags + SHARED_STATE_WRITES_ENABLED kill switch)
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: xrilic-search-service-test
+
+networks:
+  zivelogin-network-prod:
+    external: true
+
+services:
+  xrilic-search-service-test:
+    image: xrilictechnologies/xrilic-search-service:${DOCKER_TAG:-test-latest}
+    container_name: xrilic-search-service-test
+    restart: unless-stopped
+
+    networks:
+      - zivelogin-network-prod
+
+    # No public port. Uncomment for on-server debugging only (loopback):
+    # ports:
+    #   - "127.0.0.1:8010:8000"
+
+    environment:
+      APP_ENV:               test
+      TYPESENSE_HOST:        typesense-test     # NOT `typesense` (that is production)
+      TYPESENSE_PORT:        "8108"
+      TYPESENSE_API_KEY:     ${TYPESENSE_API_KEY}
+      SUPABASE_URL:          ${SUPABASE_URL}
+      SUPABASE_SERVICE_KEY:  ${SUPABASE_SERVICE_KEY}
+      WEBHOOK_SECRET:        ${WEBHOOK_SECRET}
+      ADMIN_SECRET:          ${ADMIN_SECRET}
+      POLL_INTERVAL_SEC:     "60"
+      PUBLIC_BASE_URL:       "https://sync-test.xrilic.ai"
+
+      # Shared Supabase project — never move production's cursors, claim the
+      # backfill job, or write master_candidates from this stack.
+      SHARED_STATE_WRITES_ENABLED: "false"
+      MC_INGEST_ENABLED:       "false"
+      MC_INDEX_ENABLED:        "false"
+      MC_BACKFILL_AUTO_RESUME: "false"
+
+      # Test index holds a seeded subset (seed_dev_collection.py only writes
+      # to "_dev"-suffixed collections).
+      MC_COLLECTION_NAME:             "master_candidates_v1_dev"
+      MC_SUGGESTIONS_COLLECTION_NAME: "master_candidate_suggestions_v1_dev"
+      MC_POLL_INTERVAL_SEC:  "60"
+      MC_BATCH_SIZE:         "500"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    depends_on:
+      - typesense-test
+
+  typesense-test:
+    image: typesense/typesense:27.1
+    container_name: typesense-test
+    restart: unless-stopped
+    networks:
+      - zivelogin-network-prod
+    # No public port. Uncomment for on-server debugging only (loopback):
+    # ports:
+    #   - "127.0.0.1:8109:8108"
+    environment:
+      TYPESENSE_API_KEY:   ${TYPESENSE_API_KEY}
+      TYPESENSE_DATA_DIR:  /data
+      TYPESENSE_ENABLE_CORS: "true"
+      TYPESENSE_CORS_DOMAINS: "*"
+    volumes:
+      - typesense-test-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "echo > /dev/tcp/localhost/8108 && exit 0 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+volumes:
+  typesense-test-data:
+    driver: local

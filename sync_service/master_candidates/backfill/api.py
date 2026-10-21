@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 
 from ..config import SB_HEADERS, SUPABASE_REST, SUPABASE_URL, HTTP_TIMEOUT_SUPABASE
 from . import worker, state
+from ..shared_writes import require_shared_writes
 from .config import (
     DEFAULT_BATCH_SIZE, DEFAULT_CONCURRENCY, MAX_BATCH_SIZE, MAX_CONCURRENCY,
     DEFAULT_DRY_RUN_PAGES, MAX_DRY_RUN_PAGES, SOURCE,
@@ -77,7 +78,7 @@ def _clamp(value: Optional[int], default: int, maximum: int, minimum: int = 1) -
 # ─────────────────────────────────────────────────────────────────────────────
 # Job control
 # ─────────────────────────────────────────────────────────────────────────────
-@router.post("/start")
+@router.post("/start", dependencies=[Depends(require_shared_writes)])
 async def backfill_start(request: Request, user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
     body: dict[str, Any] = {}
     try:
@@ -94,14 +95,14 @@ async def backfill_start(request: Request, user_id: str = Depends(require_global
     return result
 
 
-@router.post("/pause")
+@router.post("/pause", dependencies=[Depends(require_shared_writes)])
 async def backfill_pause(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
     async with httpx.AsyncClient() as client:
         await worker.request_pause(client)
     return {"ok": True, "status": "pausing"}
 
 
-@router.post("/stop")
+@router.post("/stop", dependencies=[Depends(require_shared_writes)])
 async def backfill_stop(user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
     async with httpx.AsyncClient() as client:
         await worker.request_stop(client)
@@ -130,7 +131,7 @@ async def backfill_errors(limit: int = 50, user_id: str = Depends(require_global
     return {"errors": rows}
 
 
-@router.post("/retry-errors")
+@router.post("/retry-errors", dependencies=[Depends(require_shared_writes)])
 async def backfill_retry_errors(request: Request, user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
     body: dict[str, Any] = {}
     try:

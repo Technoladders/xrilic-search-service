@@ -46,6 +46,12 @@ ADMIN_SECRET   = os.environ["ADMIN_SECRET"]
 INGEST_ENABLED = os.environ.get("MC_INGEST_ENABLED", "true").lower() == "true"
 INDEX_ENABLED  = os.environ.get("MC_INDEX_ENABLED",  "true").lower() == "true"
 
+# Master switch for every loop/endpoint that writes Supabase state production
+# depends on (shared cursors, backfill claim, master_candidates). Set "false"
+# on any non-production instance -- see shared_writes.py.
+SHARED_STATE_WRITES_ENABLED = os.environ.get("SHARED_STATE_WRITES_ENABLED", "true").lower() == "true"
+APP_ENV = os.environ.get("APP_ENV", "production")
+
 # ── Poll / batch defaults (override via mc_process_control table) ──────────
 DEFAULT_POLL_INTERVAL_SEC = int(os.environ.get("MC_POLL_INTERVAL_SEC", "60"))
 DEFAULT_BATCH_SIZE        = int(os.environ.get("MC_BATCH_SIZE", "500"))
