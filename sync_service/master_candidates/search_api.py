@@ -27,6 +27,10 @@ v6 CHANGE (anti-scraping hardening — response shape and frontend data UNCHANGE
   _read_search_payload were already in place. profile_pic / the avatar URL
   and /mc/avatar/{id} are deliberately left exactly as they were.)
 
+v7 CHANGE: /mc/search and /mc/search_v2 share a per-user limit of 30 requests
+per rolling minute. This is an in-process limit; counters reset on restart
+and are not shared across service replicas.
+
 v5 CHANGE (carried from before): moved Boolean query semantics into a testable
 query-planning layer (./search/) and fixed two real bugs found there:
 
@@ -80,10 +84,16 @@ v3 CHANGE (carried from before, unchanged):
 """
 
 import json as _json
+import asyncio as _asyncio
 import logging
+import math as _math
 import re as _re
 import time as _time
 import uuid
+from collections import deque
+import hashlib as _hashlib
+import hmac as _hmac
+import os as _os
 from typing import Any, Optional
 from urllib.parse import urljoin
 
@@ -125,6 +135,113 @@ TYPESENSE_MAX_PER_PAGE = 250
 # real bound on the reported total (see search/keyword_query.py) — that's
 # the honest, deliberate tradeoff documented in the implementation plan.
 RERANK_POOL_HARD_CAP = 1000
+
+
+class _UserSearchRateLimiter:
+    def __init__(self, limit: int, window_seconds: int) -> None:
+        self.limit = limit
+        self.window_seconds = window_seconds
+        self._requests: dict[str, deque[float]] = {}
+        self._lock = _asyncio.Lock()
+
+    async def check(self, user_id: str) -> None:
+        now = _time.monotonic()
+        cutoff = now - self.window_seconds
+
+        async with self._lock:
+            for account_id, timestamps in list(self._requests.items()):
+                while timestamps and timestamps[0] <= cutoff:
+                    timestamps.popleft()
+                if not timestamps:
+                    del self._requests[account_id]
+
+            timestamps = self._requests.setdefault(user_id, deque())
+            if len(timestamps) >= self.limit:
+                retry_after = max(
+                    1,
+                    _math.ceil(timestamps[0] + self.window_seconds - now),
+                )
+                logger.warning(
+                    "mc_search_rate_limited user_id=%s retry_after=%s",
+                    user_id,
+                    retry_after,
+                )
+                raise HTTPException(
+                    status_code=429,
+                    detail="Search request limit exceeded. Try again shortly.",
+                    headers={"Retry-After": str(retry_after)},
+                )
+
+            timestamps.append(now)
+
+
+_search_rate_limiter = _UserSearchRateLimiter(limit=30, window_seconds=60)
+
+
+class _AntiScrapeValidator:
+    """
+    Prevents network-tab script replay & bulk pagination scraping.
+    Requires:
+      - X-Request-Timestamp: within +/- 60s of server time.
+      - X-Request-Nonce: unique per request, consumed once (stored for 120s).
+      - X-Request-Signature: HMAC-SHA256(timestamp + nonce + raw_body).
+    Disabled in development/tests unless MC_REQUIRE_REQUEST_SIGNATURE=true.
+    """
+    def __init__(self, ttl_seconds: int = 120) -> None:
+        self.ttl_seconds = ttl_seconds
+        self._seen_nonces: dict[str, float] = {}
+        self._lock = _asyncio.Lock()
+
+    async def verify(self, request: Request, raw_body: bytes) -> None:
+        secret = _os.environ.get("MC_REQUEST_SIGNING_SECRET")
+        enforce = _os.environ.get("MC_REQUIRE_REQUEST_SIGNATURE", "false").lower() == "true"
+        if not secret or not enforce:
+            return  # opt-in safe: does not break existing calls until secret & flag are configured
+
+        timestamp_str = request.headers.get("x-request-timestamp")
+        nonce = request.headers.get("x-request-nonce")
+        client_sig = request.headers.get("x-request-signature")
+
+        if not timestamp_str or not nonce or not client_sig:
+            raise HTTPException(
+                status_code=403,
+                detail="Request validation failed: missing verification tokens.",
+            )
+
+        try:
+            ts = float(timestamp_str) / 1000.0 if len(timestamp_str) > 11 else float(timestamp_str)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Invalid request timestamp.")
+
+        now = _time.time()
+        if abs(now - ts) > 60:
+            raise HTTPException(
+                status_code=403,
+                detail="Request expired. Please refresh your search.",
+            )
+
+        # Nonce deduplication (anti-replay)
+        async with self._lock:
+            cutoff = now - self.ttl_seconds
+            for n, t in list(self._seen_nonces.items()):
+                if t < cutoff:
+                    del self._seen_nonces[n]
+            if nonce in self._seen_nonces:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Duplicate request detected.",
+                )
+            self._seen_nonces[nonce] = now
+
+        # HMAC signature check
+        message = f"{timestamp_str}:{nonce}:".encode("utf-8") + raw_body
+        expected_sig = _hmac.new(secret.encode("utf-8"), message, _hashlib.sha256).hexdigest()
+        if not _hmac.compare_digest(expected_sig.lower(), client_sig.lower()):
+            raise HTTPException(status_code=403, detail="Invalid request signature.")
+
+
+_anti_scrape_validator = _AntiScrapeValidator()
+MAX_SEARCH_OFFSET = 1000  # Max pagination depth to prevent bulk DB scraping
 
 
 def _escape(v: str) -> str:
@@ -717,6 +834,12 @@ async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str,
     page = max(1, int(payload.get("page", 1)))
     per_page = min(50, max(1, int(payload.get("per_page", 25))))
 
+    if (page - 1) * per_page >= MAX_SEARCH_OFFSET:
+        raise HTTPException(
+            status_code=400,
+            detail="Pagination limit reached. Please refine your search filters.",
+        )
+
     try:
         plan = _build_search_plan(filters)
     except KeywordSyntaxError as e:
@@ -875,8 +998,11 @@ async def _search_impl(payload: dict[str, Any], avatar_proxy: bool) -> dict[str,
 async def _read_search_payload(request: Request) -> dict[str, Any]:
     """Parse and validate a candidate-search request body."""
 
+    raw_body = await request.body()
+    await _anti_scrape_validator.verify(request, raw_body)
+
     try:
-        payload = await request.json()
+        payload = _json.loads(raw_body) if raw_body else {}
     except (ValueError, UnicodeDecodeError):
         raise HTTPException(
             status_code=400,
@@ -922,6 +1048,7 @@ async def search(
 ) -> dict[str, Any]:
     response.headers["Cache-Control"] = "no-store"
     logger.info(f"mc_search_request route=search user_id={user_id}")
+    await _search_rate_limiter.check(user_id)
     payload = await _read_search_payload(request)
     return await _search_impl(payload, avatar_proxy=False)
 
@@ -941,6 +1068,7 @@ async def search_v2(
     """
     response.headers["Cache-Control"] = "no-store"
     logger.info(f"mc_search_request route=search_v2 user_id={user_id}")
+    await _search_rate_limiter.check(user_id)
     payload = await _read_search_payload(request)
     return await _search_impl(payload, avatar_proxy=True)
 

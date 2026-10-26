@@ -182,10 +182,17 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Xrilic Search Sync Service", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://xrilic.ai", "http://localhost:8081"],
+    allow_origin_regex=r"https://[a-zA-Z0-9-]+\.xrilic\.ai",
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "x-request-timestamp",
+        "x-request-nonce",
+        "x-request-signature",
+    ],
 )
 app.include_router(mc_search.router)
 app.include_router(mc_suggestions.router)
