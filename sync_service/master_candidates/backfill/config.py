@@ -12,7 +12,7 @@ import os
 SOURCE = "portal_a"
 
 DEFAULT_BATCH_SIZE  = int(os.environ.get("MC_BACKFILL_BATCH_SIZE", "500"))
-DEFAULT_CONCURRENCY = int(os.environ.get("MC_BACKFILL_CONCURRENCY", "20"))
+DEFAULT_CONCURRENCY = int(os.environ.get("MC_BACKFILL_CONCURRENCY", "5"))
 AUTO_RESUME         = os.environ.get("MC_BACKFILL_AUTO_RESUME", "true").lower() == "true"
 
 # Server-side caps -- a caller-supplied batch_size/concurrency above these is

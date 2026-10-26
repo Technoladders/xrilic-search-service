@@ -87,7 +87,9 @@ jobs:
 
             # Master Candidates -- portal_a backfill (separate module)
             echo "MC_BACKFILL_BATCH_SIZE=500" >> .env
-            echo "MC_BACKFILL_CONCURRENCY=20" >> .env
+            # 20 parallel merges saturated the production database's disk and
+            # memory (stalls, swap); 5 is enough for the incremental runs.
+            echo "MC_BACKFILL_CONCURRENCY=5" >> .env
             echo "MC_BACKFILL_AUTO_RESUME=true" >> .env
 
             # API only: recreating typesense means a 20-40 min reload of the
