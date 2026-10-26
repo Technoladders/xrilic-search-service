@@ -254,12 +254,17 @@ async def _get_count(client: httpx.AsyncClient, table: str, params: dict[str, st
 # requests share a single in-progress computation instead of each starting
 # their own. Counts stay exact; only their freshness is bounded.
 STATS_CACHE_TTL_SEC = float(os.getenv("MC_BACKFILL_STATS_CACHE_TTL_SEC", "600"))
+# While no backfill is running the counts barely move (only new Naukri rows
+# arrive), so an open page needs them far less often. The cache is also dropped
+# the moment the running/idle state flips, so a start or a finish shows fresh
+# counts immediately instead of after this long TTL.
+STATS_CACHE_IDLE_TTL_SEC = float(os.getenv("MC_BACKFILL_STATS_CACHE_IDLE_TTL_SEC", "3600"))
 # ?refresh=true (the page's manual Refresh) bypasses the TTL, but never more
 # often than this, so a repeatedly clicked button can't bring the load back.
 STATS_MIN_REFRESH_SEC = float(os.getenv("MC_BACKFILL_STATS_MIN_REFRESH_SEC", "60"))
 
 _stats_lock = asyncio.Lock()
-_stats_cache: dict[str, Any] = {"at": None, "data": None}
+_stats_cache: dict[str, Any] = {"at": None, "data": None, "running": None}
 
 
 def _monotonic() -> float:
@@ -269,12 +274,13 @@ def _monotonic() -> float:
 @router.get("/stats")
 async def backfill_stats(refresh: bool = False,
                          user_id: str = Depends(require_global_superadmin)) -> dict[str, Any]:
-    max_age = STATS_MIN_REFRESH_SEC if refresh else STATS_CACHE_TTL_SEC
-    cached = _fresh_stats(max_age)
+    running = worker.is_running()
+    max_age = STATS_MIN_REFRESH_SEC if refresh else _stats_ttl(running)
+    cached = _fresh_stats(max_age, running)
     if cached is not None:
         return cached
     async with _stats_lock:
-        cached = _fresh_stats(max_age)   # filled by a request we waited behind
+        cached = _fresh_stats(max_age, running)   # filled by a request we waited behind
         if cached is not None:
             return cached
         data = {**await _compute_stats(), "computed_at": time.time()}
@@ -283,16 +289,24 @@ async def backfill_stats(refresh: bool = False,
         if all(data[k] is not None for k in _STATS_COUNT_KEYS):
             _stats_cache["at"] = _monotonic()
             _stats_cache["data"] = data
+            _stats_cache["running"] = running
         return {**data, "cached": False}
+
+
+def _stats_ttl(running: bool) -> float:
+    # Never shorter than the running TTL, even if the env vars are set oddly.
+    return STATS_CACHE_TTL_SEC if running else max(STATS_CACHE_TTL_SEC, STATS_CACHE_IDLE_TTL_SEC)
 
 
 _STATS_COUNT_KEYS = ("total_source_rows", "total_ingested", "total_master_candidates",
                      "total_full_profile", "total_with_contact", "total_pending_merge_review")
 
 
-def _fresh_stats(max_age: float) -> Optional[dict[str, Any]]:
+def _fresh_stats(max_age: float, running: bool) -> Optional[dict[str, Any]]:
     at = _stats_cache["at"]
     if at is None or _monotonic() - at >= max_age:
+        return None
+    if _stats_cache.get("running") is not running:   # backfill started/finished since
         return None
     return {**_stats_cache["data"], "cached": True}
 

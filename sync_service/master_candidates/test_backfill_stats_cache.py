@@ -32,7 +32,8 @@ def fake_compute(monkeypatch):
 
     monkeypatch.setattr(api, "_compute_stats", fake)
     monkeypatch.setattr(api, "_stats_lock", asyncio.Lock())
-    monkeypatch.setattr(api, "_stats_cache", {"at": None, "data": None})
+    monkeypatch.setattr(api, "_stats_cache", {"at": None, "data": None, "running": None})
+    monkeypatch.setattr(api.worker, "is_running", lambda: False)
     return calls
 
 
@@ -74,9 +75,49 @@ def test_second_call_within_ttl_is_served_from_cache(fake_compute, clock):
 
 def test_recomputes_after_ttl(fake_compute, clock):
     asyncio.run(_call())
-    clock["t"] += api.STATS_CACHE_TTL_SEC
+    clock["t"] += api._stats_ttl(False)
     asyncio.run(_call())
     assert fake_compute["n"] == 2
+
+
+def test_idle_ttl_is_longer_than_running_ttl():
+    assert api.STATS_CACHE_IDLE_TTL_SEC > api.STATS_CACHE_TTL_SEC
+    assert api._stats_ttl(True) == api.STATS_CACHE_TTL_SEC
+    assert api._stats_ttl(False) == api.STATS_CACHE_IDLE_TTL_SEC
+
+
+def test_idle_cache_outlives_the_running_ttl(fake_compute, clock):
+    asyncio.run(_call())
+    clock["t"] += api.STATS_CACHE_TTL_SEC + 1            # past the running TTL, inside the idle TTL
+    assert asyncio.run(_call())["cached"] is True
+    clock["t"] += api.STATS_CACHE_IDLE_TTL_SEC           # now past the idle TTL
+    assert asyncio.run(_call())["cached"] is False
+    assert fake_compute["n"] == 2
+
+
+def test_running_backfill_uses_the_short_ttl(fake_compute, clock, monkeypatch):
+    monkeypatch.setattr(api.worker, "is_running", lambda: True)
+    asyncio.run(_call())
+    clock["t"] += api.STATS_CACHE_TTL_SEC - 1
+    assert asyncio.run(_call())["cached"] is True
+    clock["t"] += 1
+    assert asyncio.run(_call())["cached"] is False
+    assert fake_compute["n"] == 2
+
+
+def test_state_flip_drops_the_cache_immediately(fake_compute, clock, monkeypatch):
+    state = {"running": False}
+    monkeypatch.setattr(api.worker, "is_running", lambda: state["running"])
+    asyncio.run(_call())                                  # computed while idle
+    state["running"] = True                               # backfill started a second later
+    clock["t"] += 1
+    assert asyncio.run(_call())["cached"] is False        # fresh counts at start
+    state["running"] = False                              # backfill finished
+    clock["t"] += 1
+    assert asyncio.run(_call())["cached"] is False        # fresh counts at finish
+    clock["t"] += 1
+    assert asyncio.run(_call())["cached"] is True         # then stable again
+    assert fake_compute["n"] == 3
 
 
 def test_overlapping_requests_share_one_computation(fake_compute, clock):
