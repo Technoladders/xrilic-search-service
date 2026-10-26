@@ -186,11 +186,16 @@ app.add_middleware(
         "https://xrilic.ai",
         "http://localhost:8081",
         "http://demo.localhost:8081",
+        
     ],
     allow_origin_regex=r"https://[a-zA-Z0-9-]+\.xrilic\.ai|http://[a-zA-Z0-9-]+\.localhost:8081",
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["Authorization",
+        "Content-Type",
+        "x-request-timestamp",
+        "x-request-nonce",
+        "x-request-signature",],
 )
 
 app.include_router(mc_search.router)
