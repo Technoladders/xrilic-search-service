@@ -84,6 +84,7 @@ v3 CHANGE (carried from before, unchanged):
 """
 
 import json as _json
+import msgpack as _msgpack
 import asyncio as _asyncio
 import logging
 import math as _math
@@ -1040,17 +1041,28 @@ async def _read_search_payload(request: Request) -> dict[str, Any]:
 
     return payload
 
+
+def _format_search_response(request: Request, response: Response, result: dict[str, Any]) -> Any:
+    response.headers["Vary"] = "Accept"
+    accept = request.headers.get("accept", "")
+    if "application/msgpack" in accept or "application/x-msgpack" in accept:
+        packed = _msgpack.packb(result, use_bin_type=True, default=str)
+        return Response(content=packed, media_type="application/msgpack", headers=dict(response.headers))
+    return result
+
+
 @router.post("/search")
 async def search(
     request: Request,
     response: Response,
     user_id: str = Depends(require_user),
-) -> dict[str, Any]:
+) -> Any:
     response.headers["Cache-Control"] = "no-store"
     logger.info(f"mc_search_request route=search user_id={user_id}")
     await _search_rate_limiter.check(user_id)
     payload = await _read_search_payload(request)
-    return await _search_impl(payload, avatar_proxy=False)
+    result = await _search_impl(payload, avatar_proxy=False)
+    return _format_search_response(request, response, result)
 
 
 @router.post("/search_v2")
@@ -1058,19 +1070,21 @@ async def search_v2(
     request: Request,
     response: Response,
     user_id: str = Depends(require_user),
-) -> dict[str, Any]:
+) -> Any:
     """
     Identical filter/ranking/pagination behavior to /mc/search — both call
     _search_impl, so there is no duplicated search logic to drift out of sync.
     The ONLY difference is avatar_proxy=True, which changes exactly one field
     inside _to_rr_profile: profile_pic becomes a same-origin proxy URL
     (/mc/avatar/<id>) instead of the raw third-party photo URL.
+    Supports binary msgpack via Accept: application/msgpack.
     """
     response.headers["Cache-Control"] = "no-store"
     logger.info(f"mc_search_request route=search_v2 user_id={user_id}")
     await _search_rate_limiter.check(user_id)
     payload = await _read_search_payload(request)
-    return await _search_impl(payload, avatar_proxy=True)
+    result = await _search_impl(payload, avatar_proxy=True)
+    return _format_search_response(request, response, result)
 
 
 # ── Avatar proxy ─────────────────────────────────────────────────────────
